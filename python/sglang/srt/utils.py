@@ -69,13 +69,14 @@ from triton.runtime.cache import (
     FileCacheManager,
 )
 
-try:  # Triton ≤ 3.2
+# Triton cache helpers
+try:
     from triton.runtime.cache import (
         default_cache_dir,
         default_dump_dir,
         default_override_dir,
     )
-except ImportError:  # Triton ≥ 3.3 ─ helpers renamed
+except ImportError:
     from triton.runtime.cache import (
         cache_dir     as default_cache_dir,
         dump_dir      as default_dump_dir,
