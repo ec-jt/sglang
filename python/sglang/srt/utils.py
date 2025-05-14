@@ -65,12 +65,17 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import (
-    FileCacheManager,
-    default_cache_dir,
-    default_dump_dir,
-    default_override_dir,
-)
+from triton.runtime.cache import FileCacheManager
+
+def default_cache_dir():
+    return os.path.join(tempfile.gettempdir(), "triton_cache")
+
+def default_dump_dir():
+    return os.path.join(tempfile.gettempdir(), "triton_cache_dump")
+
+def default_override_dir():
+    return os.path.join(tempfile.gettempdir(), "triton_cache_override")
+
 
 logger = logging.getLogger(__name__)
 
@@ -790,31 +795,23 @@ def maybe_set_triton_cache_manager() -> None:
 
 
 class CustomCacheManager(FileCacheManager):
-    # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
-
         self.key = key
         self.lock_path = None
+
         if dump:
-            self.cache_dir = default_dump_dir()
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-            self.lock_path = os.path.join(self.cache_dir, "lock")
-            os.makedirs(self.cache_dir, exist_ok=True)
+            self.cache_dir = os.path.join(default_dump_dir(), self.key)
         elif override:
-            self.cache_dir = default_override_dir()
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
+            self.cache_dir = os.path.join(default_override_dir(), self.key)
         else:
-            # create cache directory if it doesn't exist
-            self.cache_dir = (
-                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
-            )
-            if self.cache_dir:
-                self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
-                self.cache_dir = os.path.join(self.cache_dir, self.key)
-                self.lock_path = os.path.join(self.cache_dir, "lock")
-                os.makedirs(self.cache_dir, exist_ok=True)
-            else:
-                raise RuntimeError("Could not create or locate cache dir")
+            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.lock_path = os.path.join(self.cache_dir, "lock")
 
 
 def set_ulimit(target_soft_limit=65535):
