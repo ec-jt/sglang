@@ -815,7 +815,6 @@ class CustomCacheManager(FileCacheManager):
             # Use either the env var or the Triton cache directory
             self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or _cache_dir()
             if self.cache_dir:
-                # Suffix with PID to avoid clashes
                 self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
                 self.cache_dir = os.path.join(self.cache_dir, self.key)
                 self.lock_path = os.path.join(self.cache_dir, "lock")
