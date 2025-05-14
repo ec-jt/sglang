@@ -66,17 +66,7 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
-
-def default_cache_dir():
-    return os.path.join(tempfile.gettempdir(), "triton_cache")
-
-def default_dump_dir():
-    return os.path.join(tempfile.gettempdir(), "triton_cache_dump")
-
-def default_override_dir():
-    return os.path.join(tempfile.gettempdir(), "triton_cache_override")
-
-os.environ["TRITON_CACHE_MANAGER"] = "sglang.srt.utils:CustomCacheManager"
+from triton.knobs import cache as triton_cache
 
 logger = logging.getLogger(__name__)
 
@@ -796,23 +786,26 @@ def maybe_set_triton_cache_manager() -> None:
 
 
 class CustomCacheManager(FileCacheManager):
-    def __init__(self, key, override=False, dump=False):
+    def __init__(self, key: str, override: bool = False, dump: bool = False):
         self.key = key
         self.lock_path = None
 
+        # choose the base directory from the knob values
         if dump:
-            self.cache_dir = os.path.join(default_dump_dir(), self.key)
+            base = triton_cache.dump_dir
         elif override:
-            self.cache_dir = os.path.join(default_override_dir(), self.key)
+            base = triton_cache.override_dir
         else:
-            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
-            self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
+            # use the main cache dir, and stamp it per-PID
+            base = triton_cache.dir
+            if not base:
+                raise RuntimeError("Could not locate TRITON_CACHE_DIR")
+            base = f"{base}_{os.getpid()}"
 
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir, exist_ok=True)
-
+        # now build out our final cache_dir
+        self.cache_dir = os.path.join(base, self.key)
         self.lock_path = os.path.join(self.cache_dir, "lock")
+        os.makedirs(self.cache_dir, exist_ok=True)
 
 
 def set_ulimit(target_soft_limit=65535):
