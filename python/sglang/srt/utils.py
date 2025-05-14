@@ -76,6 +76,7 @@ def default_dump_dir():
 def default_override_dir():
     return os.path.join(tempfile.gettempdir(), "triton_cache_override")
 
+os.environ["TRITON_CACHE_MANAGER"] = "sglang.srt.utils:CustomCacheManager"
 
 logger = logging.getLogger(__name__)
 
