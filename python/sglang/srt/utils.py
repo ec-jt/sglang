@@ -788,29 +788,26 @@ def maybe_set_triton_cache_manager() -> None:
         os.environ["TRITON_CACHE_MANAGER"] = manager
 
 class CustomCacheManager(FileCacheManager):
-    def __init__(self, key, override=False, dump=False):
+    def __init__(self, key: str, override: bool = False, dump: bool = False):
         self.key = key
         self.lock_path = None
 
         if dump:
-            self.cache_dir = _dump_dir()
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-            self.lock_path = os.path.join(self.cache_dir, "lock")
-            os.makedirs(self.cache_dir, exist_ok=True)
-
+            base_dir = dump_dir()
         elif override:
-            self.cache_dir = _override_dir()
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-
+            base_dir = override_dir()
         else:
-            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or _cache_dir()
-            if self.cache_dir:
-                self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
-                self.cache_dir = os.path.join(self.cache_dir, self.key)
-                self.lock_path = os.path.join(self.cache_dir, "lock")
-                os.makedirs(self.cache_dir, exist_ok=True)
-            else:
-                raise RuntimeError("Could not create or locate cache dir")
+            base_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or cache_dir()
+            if base_dir:
+                base_dir = f"{base_dir}_{os.getpid()}"
+
+        if not base_dir:
+            raise RuntimeError("Could not locate or create a Triton cache directory")
+
+        self.cache_dir = os.path.join(base_dir, self.key)
+        self.lock_path = os.path.join(self.cache_dir, "lock")
+
+        os.makedirs(self.cache_dir, exist_ok=True)
 
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
