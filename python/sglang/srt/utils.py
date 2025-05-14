@@ -65,7 +65,8 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import FileCacheManager, cache_dir, dump_dir, override_dir
+from triton.runtime.cache import FileCacheManager
+from triton.runtime import knobs
 
 logger = logging.getLogger(__name__)
 
@@ -789,11 +790,11 @@ class CustomCacheManager(FileCacheManager):
         self.lock_path = None
 
         if dump:
-            base = dump_dir()
+            base = knobs.cache.dump_dir
         elif override:
-            base = override_dir()
+            base = knobs.cache.override_dir
         else:
-            base = os.getenv("TRITON_CACHE_DIR", "").strip() or cache_dir()
+            base = os.getenv("TRITON_CACHE_DIR", "").strip() or knobs.cache.dir
             if base:
                 base = f"{base}_{os.getpid()}"
             else:
@@ -802,6 +803,7 @@ class CustomCacheManager(FileCacheManager):
         self.cache_dir = os.path.join(base, self.key)
         self.lock_path = os.path.join(self.cache_dir, "lock")
         os.makedirs(self.cache_dir, exist_ok=True)
+
 
 
 def set_ulimit(target_soft_limit=65535):
