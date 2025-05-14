@@ -794,25 +794,21 @@ def maybe_set_triton_cache_manager() -> None:
         os.environ["TRITON_CACHE_MANAGER"] = manager
 
 class CustomCacheManager(FileCacheManager):
-    # Adapted from: https://github.com/tdoublep/vllm/blob/.../custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
         self.key = key
         self.lock_path = None
 
         if dump:
-            # Use the Triton dump directory
             self.cache_dir = _dump_dir()
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
             os.makedirs(self.cache_dir, exist_ok=True)
 
         elif override:
-            # Use the Triton override directory
             self.cache_dir = _override_dir()
             self.cache_dir = os.path.join(self.cache_dir, self.key)
 
         else:
-            # Use either the env var or the Triton cache directory
             self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or _cache_dir()
             if self.cache_dir:
                 self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
