@@ -789,21 +789,20 @@ class CustomCacheManager(FileCacheManager):
         self.lock_path = None
 
         if dump:
-            base_dir = dump_dir()
+            base = dump_dir()
         elif override:
-            base_dir = override_dir()
+            base = override_dir()
         else:
-            base_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or cache_dir()
-            if base_dir:
-                base_dir = f"{base_dir}_{os.getpid()}"
+            base = os.getenv("TRITON_CACHE_DIR", "").strip() or cache_dir()
+            if base:
+                base = f"{base}_{os.getpid()}"
+            else:
+                raise RuntimeError("Could not create or locate cache dir")
 
-        if not base_dir:
-            raise RuntimeError("Could not locate or create a Triton cache directory")
-
-        self.cache_dir = os.path.join(base_dir, self.key)
+        self.cache_dir = os.path.join(base, self.key)
         self.lock_path = os.path.join(self.cache_dir, "lock")
-
         os.makedirs(self.cache_dir, exist_ok=True)
+
 
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
