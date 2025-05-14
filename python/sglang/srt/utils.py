@@ -67,10 +67,6 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager, cache_dir, dump_dir, override_dir
 
-def _cache_dir()    -> str: return cache_dir()
-def _dump_dir()     -> str: return dump_dir()
-def _override_dir() -> str: return override_dir()
-
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
