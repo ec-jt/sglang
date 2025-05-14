@@ -67,9 +67,9 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import (
     FileCacheManager,
-    default_cache_dir,
-    default_dump_dir,
-    default_override_dir,
+    cache_dir    as default_cache_dir,
+    dump_dir     as default_dump_dir,
+    override_dir as default_override_dir,
 )
 
 def _cache_dir()    -> str: return default_cache_dir()
