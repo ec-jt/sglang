@@ -1,0 +1,50 @@
+FROM lmsysorg/sglang:blackwell AS builder
+
+ENV TRITON_BUILD_BACKEND=1 \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    PTXAS_OPTIONS="-O0" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib64:$LD_LIBRARY_PATH"
+
+RUN dnf install -y dnf-plugins-core git && \
+    dnf config-manager --add-repo=https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && \
+    rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/7fa2af80.pub && \
+    dnf install -y zlib-devel cuda-toolkit-12-8 && \
+    rm -rf /var/cache/dnf && \
+    ln -s /usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib64/libcuda.so
+
+RUN pip install --no-cache-dir \
+      --upgrade pip setuptools wheel pybind11 cmake ninja uv
+
+# Build wheel for SGLang
+WORKDIR /tmp
+RUN git clone https://github.com/ec-jt/sglang.git && \
+    cd sglang/python && \
+    pip wheel --no-cache-dir --no-deps --wheel-dir /tmp/wheelhouse ".[all]"
+
+# Build wheels for torch + triton
+RUN pip wheel --no-cache-dir --no-deps \
+      --wheel-dir /tmp/wheelhouse \
+      torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+RUN pip uninstall -y triton && \
+    git clone https://github.com/triton-lang/triton.git && \
+    cd triton && \
+    pip wheel --no-cache-dir --no-deps --wheel-dir /tmp/wheelhouse .
+
+FROM lmsysorg/sglang:blackwell AS final
+
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    PTXAS_OPTIONS="-O0" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib64:$LD_LIBRARY_PATH"
+
+# Remove any pre-existing source checkout
+RUN rm -rf /sgl-workspace/sglang
+
+COPY --from=builder /tmp/wheelhouse /wheelhouse
+
+RUN pip install --no-cache-dir /wheelhouse/* \
+ && rm -rf /wheelhouse
+
+WORKDIR /sgl-workspace
+
+ENTRYPOINT ["python3", "-m", "sglang.launch_server"]
