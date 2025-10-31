@@ -5,6 +5,7 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
+import ast
 
 import ray
 import torch
@@ -472,6 +473,18 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in ["MiniMaxM2ForCausalLM", "MiniMaxForCausalLM"]:
+        # MiniMax-M2 uses 'mlp_intermediate_size' for the MoE MLP width.
+        # Use num_local_experts + num_experts_per_tok from config.
+        if not hasattr(config, "mlp_intermediate_size"):
+            raise ValueError("MiniMax-M2 config missing 'mlp_intermediate_size'")
+        E_candidate = getattr(config, "num_local_experts", None)
+        if E_candidate is None:
+            raise ValueError("MiniMax-M2 config missing 'num_local_experts'")
+        E = E_candidate
+        topk = config.num_experts_per_tok
+        intermediate_size = config.mlp_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
     else:
         # Default: Mixtral
         E = config.num_local_experts
@@ -492,6 +505,41 @@ def main(args: argparse.Namespace):
     ):
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
+
+    # ------------------------ NEW: explicit overrides ------------------------
+    # Allow forcing the serving-time tuple so filenames match exactly.
+    if args.override_experts is not None:
+        E = args.override_experts
+    if args.override_topk is not None:
+        topk = args.override_topk
+    if args.override_mlp_intermediate is not None:
+        intermediate_size = args.override_mlp_intermediate
+    if args.override_block_shape is not None:
+        block_shape = ast.literal_eval(args.override_block_shape)
+        assert isinstance(block_shape, (list, tuple)) and len(block_shape) == 2
+        block_shape = list(block_shape)
+    # Recompute shard size after overrides
+    shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    # ------------------------------------------------------------------------
+
+    # Helpful print so you can confirm the filename components.
+    N_component = shard_intermediate_size // 2
+    print(
+        {
+            "resolved": {
+                "E": E,
+                "topk": topk,
+                "hidden_size": hidden_size,
+                "mlp_intermediate_size": intermediate_size,
+                "shard_intermediate_size": shard_intermediate_size,
+                "N_name_component": N_component,
+                "block_shape": block_shape,
+                "dtype_arg": args.dtype,
+                "tp_size": args.tp_size,
+                "per_channel_quant": per_channel_quant,
+            }
+        }
+    )
 
     if args.batch_size is None:
         batch_sizes = [
@@ -628,6 +676,33 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
-    args = parser.parse_args()
 
+    # ------------------------ NEW: explicit overrides ------------------------
+    parser.add_argument(
+        "--override-experts",
+        type=int,
+        default=None,
+        help="Force E (num experts) used for tuning and filename.",
+    )
+    parser.add_argument(
+        "--override-topk",
+        type=int,
+        default=None,
+        help="Force top-k experts per token (optional).",
+    )
+    parser.add_argument(
+        "--override-mlp-intermediate",
+        type=int,
+        default=None,
+        help="Force mlp_intermediate_size (pre-SiLU width).",
+    )
+    parser.add_argument(
+        "--override-block-shape",
+        type=str,
+        default=None,
+        help='Force block shape, e.g. "[128,128]".',
+    )
+    # -----------------------------------------------------------------------
+
+    args = parser.parse_args()
     main(args)

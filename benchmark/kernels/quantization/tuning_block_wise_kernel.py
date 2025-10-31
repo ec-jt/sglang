@@ -181,8 +181,10 @@ def get_configs_compute_bound():
 
 def get_weight_shapes(tp_size):
     # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3. Modify them, if you tune for another different model.
-    # cannot TP
+    # cannot TP added explicit shapes needed by MiniMax-M2 runtime
     total = [
+        (1024, 3072),
+        (3072, 768),
         (512 + 64, 7168),
         ((128 + 64) * 128, 7168),
         (128 * (128 + 128), 512),
