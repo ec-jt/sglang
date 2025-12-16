@@ -350,16 +350,11 @@ class MiniMaxM2Attention(nn.Module):
         self.total_num_kv_heads = config.num_key_value_heads
 
         if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
             assert self.total_num_kv_heads % tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
-        # Use head_dim from config if available, otherwise calculate
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
         )
@@ -367,14 +362,10 @@ class MiniMaxM2Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        # RoPE settings - support partial RoPE
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rotary_dim = getattr(
-            config, "rotary_dim", self.head_dim
-        )  # MiniMax uses rotary_dim=64
+        self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
 
-        # QK Normalization settings
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
 
@@ -397,21 +388,17 @@ class MiniMaxM2Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Setup RoPE with partial rotary dimension
         rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.rotary_dim,  # Use partial rotary dimension
+            rotary_dim=self.rotary_dim,
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=rope_scaling,
         )
 
-        # QK Normalization layers
         if self.use_qk_norm:
             if self.qk_norm_type == "per_layer":
-                # Use RMSNormTP for proper tensor parallel support
-                # Use total dimensions (before TP sharding) for correct normalization
                 self.q_norm = MiniMaxM2RMSNormTP(
                     self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
                 )
@@ -518,17 +505,29 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
 
+        # -------- Scatter/communicator setup (compat across sglang versions) --------
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
+        try:
+            # Newer API
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=config.num_hidden_layers,
+                is_layer_sparse=self.is_layer_sparse,
+                is_previous_layer_sparse=is_previous_layer_sparse,
+                is_next_layer_sparse=is_next_layer_sparse,
+            )
+        except TypeError:
+            # Older API (no is_next_layer_sparse)
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=config.num_hidden_layers,
+                is_layer_sparse=self.is_layer_sparse,
+                is_previous_layer_sparse=is_previous_layer_sparse,
+            )
 
+        # IMPORTANT: always create layer_communicator regardless of API path
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -543,7 +542,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -554,7 +552,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        # Fully Connected (MLP or MoE)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -578,7 +575,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
     ):
-        """Communication prepare for attention - TBO operation"""
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
@@ -592,7 +588,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        """Communication prepare for MLP - TBO operation"""
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
             self.layer_communicator.prepare_mlp(
                 state.pop("hidden_states_after_attn"),
@@ -608,7 +603,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        """Communication postprocess for layer - TBO operation"""
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
             state.pop("residual_after_comm_pre_mlp"),
@@ -795,12 +789,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        """
-        Pipeline-parallel aware forward:
-          - Non-first PP ranks take pp_proxy_tensors as input.
-          - Non-last PP ranks return PPProxyTensors and MUST NOT compute logits.
-          - Last PP rank computes logits via logits_processor.
-        """
         pp_group = get_pp_group()
 
         hidden_states_or_proxy = self.model(
@@ -811,7 +799,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Non-last PP stages must NOT compute logits / lm_head.
         if pp_group is not None and not pp_group.is_last_rank:
             return hidden_states_or_proxy
 
@@ -820,47 +807,38 @@ class MiniMaxM2ForCausalLM(nn.Module):
             hidden_states_or_proxy, aux_hidden_states = hidden_states_or_proxy
 
         return self.logits_processor(
-            input_ids, hidden_states_or_proxy, self.lm_head, forward_batch, aux_hidden_states
+            input_ids,
+            hidden_states_or_proxy,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
         )
 
     def _pp_should_skip_param(self, param_name: str) -> bool:
-        """
-        Return True if param_name is expected to be absent on this PP rank.
-        This avoids masking genuine mapping bugs while still allowing each PP
-        stage to ignore weights for other stages when the checkpoint iterator
-        feeds "all keys" to every rank.
-        """
         pp_group = get_pp_group()
         if pp_group is None or pp_group.world_size <= 1:
             return False
 
-        # Layer weights: only [start_layer, end_layer) exist on this rank.
         m = _LAYER_RE.match(param_name)
         if m is not None:
             layer_id = int(m.group(1))
             return not (self.model.start_layer <= layer_id < self.model.end_layer)
 
-        # Embeddings live on the first stage.
         if param_name.startswith("model.embed_tokens."):
             return not pp_group.is_first_rank
 
-        # Final norm and lm_head live on the last stage.
         if param_name.startswith("model.norm."):
             return not pp_group.is_last_rank
         if param_name.startswith("lm_head."):
             return not pp_group.is_last_rank
 
-        # Everything else is expected to exist on all ranks (if present in this model).
         return False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load model weights with proper mapping for MiniMax architecture (PP-safe)."""
-
         pp_group = get_pp_group()
         is_pp = (pp_group is not None) and (pp_group.world_size > 1)
 
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -868,8 +846,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
@@ -888,24 +864,19 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
-                continue  # skip spec decode layers for main model
+                continue
 
             handled = False
 
-            # ---- stacked params (qkv, gate/up merge) ----
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
 
-                # Keep upstream behavior: skip expert tensors here BEFORE renaming
-                # to avoid creating bogus names like gate_gate_up_proj.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
 
                 mapped_name = name.replace(weight_name, param_name)
 
-                # Skip loading extra bias for GPTQ models.
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     handled = True
                     break
@@ -917,8 +888,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     raise KeyError(mapped_name)
 
                 param = params_dict[mapped_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(mapped_name)
                 handled = True
                 break
@@ -926,7 +896,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if handled:
                 continue
 
-            # ---- expert params mapping (MoE weights) ----
             for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
                 if weight_name not in name:
                     continue
@@ -940,8 +909,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     raise KeyError(mapped_name)
 
                 param = params_dict[mapped_name]
-                weight_loader = param.weight_loader
-                weight_loader(
+                param.weight_loader(
                     param,
                     loaded_weight,
                     mapped_name,
@@ -955,14 +923,11 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if handled:
                 continue
 
-            # ---- everything else (embeddings, norms, lm_head, fp8 scales, etc.) ----
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
-            # Remapping the name of FP8 kv-scale.
             remapped = maybe_remap_kv_scale_name(name, params_dict)
             if remapped is None:
-                # Upstream behavior: unknown kv-scale names are ignored.
                 continue
             name = remapped
 
@@ -1000,5 +965,4 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
-# Entry class for model registration
 EntryClass = MiniMaxM2ForCausalLM
