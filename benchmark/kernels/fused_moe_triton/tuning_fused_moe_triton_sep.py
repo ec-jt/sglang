@@ -812,7 +812,7 @@ if __name__ == "__main__":
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
-    parser.add_argument("--topk-ids-dir", type=str, required=True)
+    parser.add_argument("--topk-ids-dir", type=str, required=False)
     args = parser.parse_args()
 
     main(args)
