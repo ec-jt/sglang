@@ -653,21 +653,32 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
         
-        # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
-        # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        # Only create vision tower and mm projector on the first PP rank
+        # Non-first PP ranks don't need vision components as they only process
+        # hidden states from previous PP ranks
+        if self.pp_group.is_first_rank:
+            # Create vision tower
+            self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
+            # Create mm projector
+            self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        else:
+            self.vision_tower = PPMissingLayer()
+            self.mm_projector = PPMissingLayer()
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
-        if hasattr(self.language_model, "dtype"):
+        if self.pp_group.is_first_rank and hasattr(self.language_model, "dtype"):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # This should only be called on the first PP rank
+        if not self.pp_group.is_first_rank:
+            raise RuntimeError("get_image_feature should only be called on the first PP rank")
+        
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.vision_tower.dtype
         )
@@ -732,16 +743,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 # All other weights go to language model
                 language_weights.append((name, loaded_weight))
 
-        # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
+        # Load vision tower weights only on the first PP rank
+        if self.pp_group.is_first_rank:
+            vision_state_dict = dict(vision_weights)
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            for name, loaded_weight in vision_state_dict.items():
+                if name not in params_dict:
+                    raise ValueError(f"Weight {name} not found in params_dict")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                weight_loader(param, loaded_weight)
 
         # Load language model weights
         if language_weights:
