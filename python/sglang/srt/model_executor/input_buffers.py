@@ -79,9 +79,12 @@ class GraphInputBuffers:
             )
 
             if pp_size > 1:
+                # Use max_num_token instead of max_bs to handle cases where
+                # num_tokens = bs * num_tokens_per_bs (e.g., speculative decoding)
+                # This prevents out-of-bounds memory access during CUDA graph capture
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hidden_size), dtype=dtype),
+                    "residual": torch.zeros((max_num_token, hidden_size), dtype=dtype),
                 }
             else:
                 pp_proxy_tensors = None
