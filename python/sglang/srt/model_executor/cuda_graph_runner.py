@@ -487,6 +487,13 @@ class CudaGraphRunner:
                 else reversed(self.capture_bs)
             )
             for i, bs in enumerate(capture_range):
+                # Synchronize PP ranks at the start of each batch size capture
+                # to ensure all ranks are capturing the same batch size together.
+                # This is the primary synchronization point for PP CUDA graph capture.
+                if self.pp_size > 1:
+                    self.device_module.synchronize()
+                    self.model_runner.pp_group.barrier()
+                
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
                         self.model_runner.device,
@@ -737,6 +744,15 @@ class CudaGraphRunner:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+        
+        # Synchronize PP ranks before actual graph capture to ensure all ranks
+        # are ready to capture the same batch size. This is critical because
+        # the graph capture includes NCCL operations that must have matching
+        # tensor sizes across all PP ranks.
+        if self.pp_size > 1:
+            self.device_module.synchronize()
+            self.model_runner.pp_group.barrier()
+        
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
