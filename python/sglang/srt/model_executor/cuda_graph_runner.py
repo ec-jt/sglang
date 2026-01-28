@@ -725,6 +725,12 @@ class CudaGraphRunner:
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
+            # Synchronize PP ranks to ensure all ranks capture the same batch size.
+            # This prevents NCCL tensor size mismatch during PP hidden state transfer.
+            # Without this barrier, PP ranks may capture different batch sizes simultaneously,
+            # causing illegal memory access when NCCL Send/Recv operations have mismatched sizes.
+            if self.pp_size > 1:
+                self.model_runner.pp_group.barrier()
             run_once()
 
         if get_global_graph_memory_pool() is None:

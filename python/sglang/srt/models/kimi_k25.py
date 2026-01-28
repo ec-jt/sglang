@@ -9,7 +9,9 @@ from torch import nn
 from transformers import activations
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -30,7 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
@@ -649,21 +651,34 @@ class KimiK25ForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
-        # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        self.pp_group = get_pp_group()
+        
+        # Only create vision tower and mm projector on the first PP rank
+        # Non-first PP ranks don't need vision components as they only process
+        # hidden states from previous PP ranks
+        if self.pp_group.is_first_rank:
+            # Create vision tower
+            self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
+            # Create mm projector
+            self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        else:
+            self.vision_tower = PPMissingLayer()
+            self.mm_projector = PPMissingLayer()
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
-        if hasattr(self.language_model, "dtype"):
+        if self.pp_group.is_first_rank and hasattr(self.language_model, "dtype"):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # This should only be called on the first PP rank
+        if not self.pp_group.is_first_rank:
+            raise RuntimeError("get_image_feature should only be called on the first PP rank")
+        
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.vision_tower.dtype
         )
@@ -692,15 +707,34 @@ class KimiK25ForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        
+        # During CUDA graph capture, skip vision processing entirely
+        # and call the language model directly. This avoids issues with
+        # the multimodal embedding routine during graph capture, especially
+        # on PP non-first ranks where vision components don't exist.
+        if get_is_capture_mode():
+            return self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=None,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        
+        # Normal path with vision processing via general_mm_embed_routine
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+            multimodal_model=self,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         return hidden_states
@@ -725,16 +759,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 # All other weights go to language model
                 language_weights.append((name, loaded_weight))
 
-        # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
+        # Load vision tower weights only on the first PP rank
+        if self.pp_group.is_first_rank:
+            vision_state_dict = dict(vision_weights)
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            for name, loaded_weight in vision_state_dict.items():
+                if name not in params_dict:
+                    raise ValueError(f"Weight {name} not found in params_dict")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                weight_loader(param, loaded_weight)
 
         # Load language model weights
         if language_weights:
