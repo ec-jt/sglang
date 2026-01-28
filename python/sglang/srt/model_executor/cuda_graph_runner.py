@@ -581,8 +581,11 @@ class CudaGraphRunner:
 
         # pipeline parallelism
         if self.pp_size > 1:
+            # Ensure PP proxy tensors are contiguous for NCCL operations.
+            # Non-contiguous tensors can cause issues during graph capture
+            # because NCCL expects contiguous memory regions.
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:num_tokens].contiguous() for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         if self.require_mlp_tp_gather:
@@ -715,9 +718,11 @@ class CudaGraphRunner:
                 self.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
+                # Use the original sliced tensors directly instead of cloning.
+                # Cloning creates new memory addresses that NCCL may not have registered
+                # for graph capture, leading to illegal memory access errors.
+                # The pp_proxy_tensors are already properly sized at line 587-589.
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -726,6 +731,14 @@ class CudaGraphRunner:
                 **kwargs,
             )
             return logits_output_or_pp_proxy_tensors
+
+        # Initialize graph pool BEFORE warmup runs to ensure NCCL operations
+        # during warmup use the same memory pool as actual graph capture.
+        # This is critical for PP because NCCL send/recv operations must use
+        # consistent memory addresses across all warmup and capture phases.
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        set_graph_pool_id(get_global_graph_memory_pool())
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
@@ -736,23 +749,19 @@ class CudaGraphRunner:
             # This prevents NCCL tensor size mismatch during PP hidden state transfer.
             # Without this barrier, PP ranks may capture different batch sizes simultaneously,
             # causing illegal memory access when NCCL Send/Recv operations have mismatched sizes.
+            # Use device-level barrier for proper NCCL stream synchronization.
             if self.pp_size > 1:
-                self.model_runner.pp_group.barrier()
+                torch.distributed.barrier(group=self.model_runner.pp_group.device_group)
             run_once()
 
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
-        
         # Synchronize PP ranks before actual graph capture to ensure all ranks
         # are ready to capture the same batch size. This is critical because
         # the graph capture includes NCCL operations that must have matching
         # tensor sizes across all PP ranks.
         if self.pp_size > 1:
             self.device_module.synchronize()
-            self.model_runner.pp_group.barrier()
-        
+            torch.distributed.barrier(group=self.model_runner.pp_group.device_group)
+
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
