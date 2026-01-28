@@ -709,6 +709,22 @@ class KimiK25ForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        
+        # During CUDA graph capture, skip vision processing entirely
+        # and call the language model directly. This avoids issues with
+        # the multimodal embedding routine during graph capture, especially
+        # on PP non-first ranks where vision components don't exist.
+        if get_is_capture_mode():
+            return self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=None,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        
+        # Normal path with vision processing via general_mm_embed_routine
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
