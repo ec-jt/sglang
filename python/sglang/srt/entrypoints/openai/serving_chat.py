@@ -1237,6 +1237,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Models that thinking by default, and can be disabled by setting enable_thinking=False
             return (
                 not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking", True) is True
                 or request.chat_template_kwargs.get("enable_thinking") is not False
             )
         return True  # default
