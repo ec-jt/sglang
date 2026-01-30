@@ -93,6 +93,14 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    # Handle PP desync: if we didn't receive valid proxy tensors on non-first rank,
+                    # skip this batch to avoid KeyError crash in model forward
+                    if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
+                        logger.warning(
+                            f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected)"
+                        )
+                        self.cur_batch = None
+                        self.mbs[mb_id] = None
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -232,6 +240,14 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    # Handle PP desync: if we didn't receive valid proxy tensors on non-first rank,
+                    # skip this batch to avoid KeyError crash in model forward
+                    if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
+                        logger.warning(
+                            f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected)"
+                        )
+                        self.cur_batch = None
+                        self.mbs[mb_id] = None
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -381,6 +397,14 @@ class SchedulerPPMixin:
                     pp_proxy_tensors = None
                     if not self.cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        # Handle PP desync: if we didn't receive valid proxy tensors on non-first rank,
+                        # skip this batch to avoid KeyError crash in model forward
+                        if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
+                            logger.warning(
+                                f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected)"
+                            )
+                            self.cur_batch = None
+                            self.mbs[mb_id] = None
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -929,13 +953,27 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    )
+            tensor_dict = self.pp_group.recv_tensor_dict(
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
                 )
             )
+            # Validate that we received the expected tensors
+            if tensor_dict is None:
+                logger.warning(
+                    f"[PP{self.pp_rank}] Received None tensor_dict from previous stage"
+                )
+                return None
+            if "hidden_states" not in tensor_dict:
+                logger.error(
+                    f"[PP{self.pp_rank}] Received tensor_dict missing 'hidden_states'. "
+                    f"Keys received: {list(tensor_dict.keys())}. "
+                    f"This indicates PP desynchronization - previous rank may not have sent proxy tensors."
+                )
+                # Return None to signal that we should skip this batch
+                # This prevents the KeyError crash in the model forward
+                return None
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(

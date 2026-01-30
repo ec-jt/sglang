@@ -204,6 +204,10 @@ class GraphInputBuffers:
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
+                if key not in pp_proxy_tensors.tensors:
+                    # Skip if the key is missing - this can happen during PP desync
+                    # The scheduler_pp_mixin.py should have already handled this case
+                    continue
                 src = pp_proxy_tensors.tensors[key]
                 dim = src.shape[0]
                 buf[:dim].copy_(src)
