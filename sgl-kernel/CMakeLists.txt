@@ -148,8 +148,9 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    # MODIFIED: Build only for SM120a (GB200/RTX 5090) - removed SM90 base
-    # "-gencode=arch=compute_90,code=sm_90"
+    # MODIFIED: Build for both SM90a (for cluster-based kernels) and SM120a (GB200/RTX 5090)
+    # SM90a is needed for FP8 GEMM/MoE kernels that use cluster-based multicast instructions
+    "-gencode=arch=compute_90a,code=sm_90a"
     "-gencode=arch=compute_120a,code=sm_120a"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
@@ -198,7 +199,8 @@ list(APPEND SGL_KERNEL_CUDA_FLAGS
 
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
-option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
+# MODIFIED: Enable NVFP4 for Blackwell (SM120) native 4-bit format
+option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              ON)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
@@ -258,9 +260,12 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-# MODIFIED: Disabled SM90a for FA3 - building only for SM120a
+# MODIFIED: Disabled FA3 entirely for SM120a builds
+# FA3 SM90 kernels use cluster-based multicast instructions that don't work well on SM120
+# FlashMLA handles attention for Kimi-K2.5, so FA3 is not needed
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
+    # Disable FA3 for SM120-only builds - FlashMLA is used instead
+    set(SGL_KERNEL_ENABLE_FA3 OFF)
     # list(APPEND SGL_KERNEL_CUDA_FLAGS
     #     "-gencode=arch=compute_90a,code=sm_90a"
     # )
@@ -274,6 +279,7 @@ endif()
 
 # All source files
 # NOTE: Please sort the filenames alphabetically
+# MODIFIED: Removed GPTQ/GGUF/AWQ kernels for faster build
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
@@ -294,7 +300,7 @@ set(SOURCES
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
-    "csrc/gemm/awq_kernel.cu"
+    # REMOVED: "csrc/gemm/awq_kernel.cu" - Not using AWQ
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
     "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
@@ -314,10 +320,10 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    "csrc/gemm/marlin/gptq_marlin.cu"
-    "csrc/gemm/marlin/gptq_marlin_repack.cu"
-    "csrc/gemm/marlin/awq_marlin_repack.cu"
-    "csrc/gemm/gptq/gptq_kernel.cu"
+    # REMOVED: "csrc/gemm/marlin/gptq_marlin.cu" - Not using GPTQ (keeping Marlin MoE)
+    # REMOVED: "csrc/gemm/marlin/gptq_marlin_repack.cu" - Not using GPTQ
+    # REMOVED: "csrc/gemm/marlin/awq_marlin_repack.cu" - Not using AWQ
+    # REMOVED: "csrc/gemm/gptq/gptq_kernel.cu" - Not using GPTQ
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/kvcacheio/transfer.cu"
@@ -341,7 +347,7 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
-    "csrc/quantization/gguf/gguf_kernel.cu"
+    # REMOVED: "csrc/quantization/gguf/gguf_kernel.cu" - Not using GGUF
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
