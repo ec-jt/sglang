@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
     is_sm100_supported,
+    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -238,7 +239,7 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
 
         fmha_backend = "auto"
-        if is_sm100_supported():
+        if is_sm100_supported() or is_sm120_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on B200
             if model_runner.server_args.enable_piecewise_cuda_graph:
