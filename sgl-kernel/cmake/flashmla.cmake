@@ -102,6 +102,34 @@ if(${CUDA_VERSION} VERSION_GREATER 12.8)
     else()
         message(STATUS "cutlass/arch/config.h already patched for SM120a")
     endif()
+
+    # Patch dense_fp8_python_api.cpp to allow SM120 in addition to SM90
+    # The original code checks: major == 9 && minor == 0
+    # We need to also allow SM120 (major == 12)
+    set(DENSE_FP8_API_FILE "${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp")
+    if(EXISTS "${DENSE_FP8_API_FILE}")
+        file(READ "${DENSE_FP8_API_FILE}" DENSE_FP8_API_CONTENT)
+        string(FIND "${DENSE_FP8_API_CONTENT}" "major == 12" SM120_FP8_FOUND)
+        if(SM120_FP8_FOUND EQUAL -1)
+            # Patch the SM90 check to also allow SM120
+            # Pattern 1: "major == 9 && minor == 0" -> "(major == 9 && minor == 0) || major == 12"
+            string(REPLACE
+                "major == 9 && minor == 0"
+                "(major == 9 && minor == 0) || major == 12"
+                DENSE_FP8_API_CONTENT "${DENSE_FP8_API_CONTENT}")
+            # Pattern 2: "major == 9" alone -> "(major == 9 || major == 12)"
+            string(REGEX REPLACE
+                "major == 9([^&])"
+                "(major == 9 || major == 12)\\1"
+                DENSE_FP8_API_CONTENT "${DENSE_FP8_API_CONTENT}")
+            file(WRITE "${DENSE_FP8_API_FILE}" "${DENSE_FP8_API_CONTENT}")
+            message(STATUS "Patched dense_fp8_python_api.cpp for SM120 (GB200) support")
+        else()
+            message(STATUS "dense_fp8_python_api.cpp already patched for SM120")
+        endif()
+    else()
+        message(WARNING "dense_fp8_python_api.cpp not found at ${DENSE_FP8_API_FILE}")
+    endif()
 endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
