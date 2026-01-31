@@ -60,7 +60,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.21",
+  "sgl-kernel>=0.3.21",  # Changed from == to >= so pip won't downgrade pre-built SM120 version
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",

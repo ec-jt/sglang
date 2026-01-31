@@ -17,18 +17,91 @@ set(FLASHMLA_CUDA_FLAGS
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
-# Only build FlashMLA kernels if we are building for something compatible with
-# sm90a
-if(${CUDA_VERSION} VERSION_GREATER 12.4)
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
-endif()
+# FlashMLA kernels support SM90a (Hopper), SM100a/SM103a (Blackwell), SM120a (GB200/RTX 5090)
+# BUILD ONLY FOR SM120a to speed up build time (we only have GB200/RTX 5090 GPUs)
+# To restore multi-arch support, uncomment the SM90a/SM100a/SM103a blocks below
+
+# DISABLED: SM90a (Hopper H100/H200) - uncomment if needed
+# if(${CUDA_VERSION} VERSION_GREATER 12.4)
+#     list(APPEND FLASHMLA_CUDA_FLAGS
+#         "-gencode=arch=compute_90a,code=sm_90a"
+#     )
+# endif()
+
+# DISABLED: SM100a (Blackwell B100/B200) - uncomment if needed
+# if(${CUDA_VERSION} VERSION_GREATER 12.8)
+#     list(APPEND FLASHMLA_CUDA_FLAGS
+#         "-gencode=arch=compute_100a,code=sm_100a"
+#     )
+# endif()
+
+# SM120a (GB200 / RTX 5090) - ENABLED
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_120a,code=sm_120a"
     )
+
+    # Patch flashmla_utils.h for SM120a (Grace-Blackwell GB200) support
+    set(FLASHMLA_UTILS_FILE "${repo-flashmla_SOURCE_DIR}/csrc/flashmla_utils.h")
+    file(READ "${FLASHMLA_UTILS_FILE}" FLASHMLA_UTILS_CONTENT)
+    
+    # Check if IS_SM120 macro already exists
+    string(FIND "${FLASHMLA_UTILS_CONTENT}" "IS_SM120" SM120_MACRO_FOUND)
+    if(SM120_MACRO_FOUND EQUAL -1)
+        # Add IS_SM120 macro after IS_SM100 definition
+        string(REPLACE
+            "#define IS_SM100 0
+#endif"
+            "#define IS_SM100 0
+#endif
+
+// SM120a (Grace-Blackwell GB200) detection
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)
+#define IS_SM120 1
+#else
+#define IS_SM120 0
+#endif"
+            FLASHMLA_UTILS_CONTENT "${FLASHMLA_UTILS_CONTENT}")
+        file(WRITE "${FLASHMLA_UTILS_FILE}" "${FLASHMLA_UTILS_CONTENT}")
+        message(STATUS "Patched flashmla_utils.h for SM120a (GB200) support")
+    else()
+        message(STATUS "flashmla_utils.h already patched for SM120a")
+    endif()
+
+    # Patch cutlass/arch/config.h for SM120a architecture defines
+    set(CUTLASS_CONFIG_FILE "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/arch/config.h")
+    file(READ "${CUTLASS_CONFIG_FILE}" CUTLASS_CONFIG_CONTENT)
+    string(FIND "${CUTLASS_CONFIG_CONTENT}" "SM120" SM120_CUTLASS_FOUND)
+    if(SM120_CUTLASS_FOUND EQUAL -1)
+        # Add SM120a support block before SM100 block
+        string(REPLACE
+"// SM100 and SM100a"
+"// SM120 and SM120a (Grace-Blackwell GB200)
+#if !CUTLASS_CLANG_CUDA && (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
+  #define CUTLASS_ARCH_MMA_SM120_SUPPORTED 1
+  #define CUTLASS_ARCH_MMA_SM120A_SUPPORTED 1
+  #if (!defined(CUTLASS_ARCH_MMA_SM120_ENABLED) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200)
+    #define CUTLASS_ARCH_MMA_SM120_ENABLED 1
+    #define CUTLASS_ARCH_MMA_SM120A_ENABLED 1
+    // SM120a inherits SM100a capabilities
+    #if !defined(CUTLASS_ARCH_MMA_SM100A_ENABLED)
+      #define CUTLASS_ARCH_MMA_SM100A_ENABLED 1
+    #endif
+    #if !defined(CUTLASS_ARCH_MMA_SM100F_ENABLED)
+      #define CUTLASS_ARCH_MMA_SM100F_ENABLED 1
+    #endif
+  #endif
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// SM100 and SM100a"
+            CUTLASS_CONFIG_CONTENT "${CUTLASS_CONFIG_CONTENT}")
+        file(WRITE "${CUTLASS_CONFIG_FILE}" "${CUTLASS_CONFIG_CONTENT}")
+        message(STATUS "Patched cutlass/arch/config.h for SM120a (GB200) support")
+    else()
+        message(STATUS "cutlass/arch/config.h already patched for SM120a")
+    endif()
 endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
@@ -79,9 +152,10 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
         message(STATUS "cutlass/arch/config.h already patched for SM103a")
     endif()
 
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_103a,code=sm_103a"
-    )
+    # DISABLED: SM103a (Blackwell B300) - uncomment if needed
+    # list(APPEND FLASHMLA_CUDA_FLAGS
+    #     "-gencode=arch=compute_103a,code=sm_103a"
+    # )
 endif()
 
 
