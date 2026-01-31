@@ -279,7 +279,7 @@ endif()
 
 # All source files
 # NOTE: Please sort the filenames alphabetically
-# MODIFIED: Removed GPTQ/GGUF/AWQ kernels for faster build
+# All kernels included - required by common_extension.cc symbol registration
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
@@ -300,7 +300,7 @@ set(SOURCES
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
-    # REMOVED: "csrc/gemm/awq_kernel.cu" - Not using AWQ
+    "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
     "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
@@ -320,10 +320,10 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    # REMOVED: "csrc/gemm/marlin/gptq_marlin.cu" - Not using GPTQ (keeping Marlin MoE)
-    # REMOVED: "csrc/gemm/marlin/gptq_marlin_repack.cu" - Not using GPTQ
-    # REMOVED: "csrc/gemm/marlin/awq_marlin_repack.cu" - Not using AWQ
-    # REMOVED: "csrc/gemm/gptq/gptq_kernel.cu" - Not using GPTQ
+    "csrc/gemm/marlin/gptq_marlin.cu"
+    "csrc/gemm/marlin/gptq_marlin_repack.cu"
+    "csrc/gemm/marlin/awq_marlin_repack.cu"
+    "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/kvcacheio/transfer.cu"
@@ -347,7 +347,7 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
-    # REMOVED: "csrc/quantization/gguf/gguf_kernel.cu" - Not using GGUF
+    "csrc/quantization/gguf/gguf_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
