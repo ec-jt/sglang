@@ -125,11 +125,14 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
 endif()
 
 # Configure gencode below SM90
+# DISABLED: Building only for SM120a (GB200/RTX 5090) to speed up build time
+# To restore multi-arch support, change DEFAULT_ENABLE_BELOW_SM90 to ON
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(DEFAULT_ENABLE_BELOW_SM90 OFF)
     message(STATUS "For aarch64, disable gencode below SM90 by default")
 else()
-    set(DEFAULT_ENABLE_BELOW_SM90 ON)
+    # MODIFIED: Disabled SM80/SM89 to build only for SM120a
+    set(DEFAULT_ENABLE_BELOW_SM90 OFF)
 endif()
 
 option(ENABLE_BELOW_SM90 "Enable gencode below SM90" ${DEFAULT_ENABLE_BELOW_SM90})
@@ -145,7 +148,9 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
+    # MODIFIED: Build only for SM120a (GB200/RTX 5090) - removed SM90 base
+    # "-gencode=arch=compute_90,code=sm_90"
+    "-gencode=arch=compute_120a,code=sm_120a"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -225,37 +230,40 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
+# MODIFIED: Disabled SM100a/SM103a - building only for SM120a (already added in base flags)
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120a,code=sm_120a"
-    )
+    # SM120a already added in base SGL_KERNEL_CUDA_FLAGS above
+    # list(APPEND SGL_KERNEL_CUDA_FLAGS
+    #     "-gencode=arch=compute_100a,code=sm_100a"
+    #     "-gencode=arch=compute_120a,code=sm_120a"
+    # )
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103a,code=sm_103a"
+            # "-gencode=arch=compute_103a,code=sm_103a"
             "--compress-mode=size"
         )
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_110a,code=sm_110a"
-                "-gencode=arch=compute_121a,code=sm_121a"
-            )
-        endif()
-    else()
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_101a,code=sm_101a"
-            )
-        endif()
+        # if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        #     list(APPEND SGL_KERNEL_CUDA_FLAGS
+        #         "-gencode=arch=compute_110a,code=sm_110a"
+        #         "-gencode=arch=compute_121a,code=sm_121a"
+        #     )
+        # endif()
+    # else()
+    #     if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    #         list(APPEND SGL_KERNEL_CUDA_FLAGS
+    #             "-gencode=arch=compute_101a,code=sm_101a"
+    #         )
+    #     endif()
     endif()
 endif()
 
+# MODIFIED: Disabled SM90a for FA3 - building only for SM120a
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     set(SGL_KERNEL_ENABLE_FA3 ON)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
+    # list(APPEND SGL_KERNEL_CUDA_FLAGS
+    #     "-gencode=arch=compute_90a,code=sm_90a"
+    # )
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
@@ -441,6 +449,7 @@ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
+# MODIFIED: Building only for SM120a (GB200/RTX 5090)
 if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
@@ -448,7 +457,8 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-O3"
         "-Xcompiler"
         "-fPIC"
-        "-gencode=arch=compute_90a,code=sm_90a"
+        # MODIFIED: Changed from SM90a to SM120a
+        "-gencode=arch=compute_120a,code=sm_120a"
         "-std=c++17"
         "-DCUTE_USE_PACKED_TUPLE=1"
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
