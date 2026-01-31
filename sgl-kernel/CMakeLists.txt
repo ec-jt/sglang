@@ -201,7 +201,8 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 # MODIFIED: Enable NVFP4 for Blackwell (SM120) native 4-bit format
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              ON)
-option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+# FA3 is required for multimodal processors (vision.py imports flash_attn)
+option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ON)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -260,15 +261,17 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-# MODIFIED: Disabled FA3 entirely for SM120a builds
-# FA3 SM90 kernels use cluster-based multicast instructions that don't work well on SM120
-# FlashMLA handles attention for Kimi-K2.5, so FA3 is not needed
+# MODIFIED: Enable FA3 for SM120a builds - required for multimodal processors
+# FA3 SM90 kernels are compiled with SM90a gencode (SM120 can run SM90a code)
+# Multimodal processors (vision.py) import flash_attn which requires flash_ops
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    # Disable FA3 for SM120-only builds - FlashMLA is used instead
-    set(SGL_KERNEL_ENABLE_FA3 OFF)
-    # list(APPEND SGL_KERNEL_CUDA_FLAGS
-    #     "-gencode=arch=compute_90a,code=sm_90a"
-    # )
+    # Enable FA3 - required for multimodal processors (KimiK25ForConditionalGeneration)
+    set(SGL_KERNEL_ENABLE_FA3 ON)
+    message(STATUS "FA3 enabled - required for multimodal processors")
+    # Add SM90a gencode for FA3 source files (*_sm90.cu)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
+    )
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
@@ -455,7 +458,7 @@ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
-# MODIFIED: Building only for SM120a (GB200/RTX 5090)
+# MODIFIED: Building for SM90a (FA3 source files) and SM120a (runtime target)
 if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
@@ -463,7 +466,9 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-O3"
         "-Xcompiler"
         "-fPIC"
-        # MODIFIED: Changed from SM90a to SM120a
+        # MODIFIED: SM90a for FA3 source files (*_sm90.cu), SM120a for runtime
+        # SM120 can run SM90a code via compatibility mode
+        "-gencode=arch=compute_90a,code=sm_90a"
         "-gencode=arch=compute_120a,code=sm_120a"
         "-std=c++17"
         "-DCUTE_USE_PACKED_TUPLE=1"
