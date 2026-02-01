@@ -39,15 +39,18 @@ set(FLASHMLA_CUDA_FLAGS
 )
 
 # FlashMLA kernels support SM90a (Hopper), SM100a/SM103a (Blackwell), SM120a (GB200/RTX 5090)
-# BUILD ONLY FOR SM120a to speed up build time (we only have GB200/RTX 5090 GPUs)
-# To restore multi-arch support, uncomment the SM90a/SM100a/SM103a blocks below
+#
+# IMPORTANT: SM90a gencode is REQUIRED for the dense_fp8 extension kernels which use
+# SM90-specific CUDA intrinsics (GMMA operations, SM90_U32x4_STSM_N, etc.)
+# SM120 can run SM90a code via compatibility mode, but the code must be compiled with SM90a gencode.
 
-# DISABLED: SM90a (Hopper H100/H200) - uncomment if needed
-# if(${CUDA_VERSION} VERSION_GREATER 12.4)
-#     list(APPEND FLASHMLA_CUDA_FLAGS
-#         "-gencode=arch=compute_90a,code=sm_90a"
-#     )
-# endif()
+# SM90a (Hopper H100/H200) - REQUIRED for dense_fp8 extension kernels
+# The extension/sm90/dense_fp8/ kernels use SM90 GMMA intrinsics that require SM90a gencode
+if(${CUDA_VERSION} VERSION_GREATER 12.4)
+    list(APPEND FLASHMLA_CUDA_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
+    )
+endif()
 
 # DISABLED: SM100a (Blackwell B100/B200) - uncomment if needed
 # if(${CUDA_VERSION} VERSION_GREATER 12.8)
