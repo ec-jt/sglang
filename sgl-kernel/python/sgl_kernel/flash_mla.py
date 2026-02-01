@@ -1,17 +1,40 @@
 from typing import Optional, Tuple
+import logging
+import warnings
 
 import torch
 
+logger = logging.getLogger(__name__)
+
+# Try to import flashmla_ops which triggers TORCH_LIBRARY_FRAGMENT registration
 try:
     from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    _flashmla_import_error = None
+    logger.debug("flashmla_ops loaded successfully")
 except Exception as _e:
     _flashmla_import_error = _e
-else:
-    _flashmla_import_error = None
+    # Log the actual error for debugging
+    warnings.warn(
+        f"Failed to import sgl_kernel.flashmla_ops: {_e}. "
+        "Dense FP8 MLA kernels will not be available. "
+        "This may be due to missing SM90a gencode in the build.",
+        RuntimeWarning
+    )
 
 _IMPORT_ERROR = ImportError(
-    "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
+    "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4 "
+    "and that the extension was built with SM90a gencode for dense FP8 kernels."
 )
+
+
+def _check_flashmla_ops_loaded():
+    """Check if flashmla_ops loaded successfully and raise informative error if not."""
+    if _flashmla_import_error is not None:
+        raise ImportError(
+            f"flashmla_ops failed to load: {_flashmla_import_error}. "
+            "This is required for dense FP8 MLA. "
+            "Ensure the build includes SM90a gencode (-gencode=arch=compute_90a,code=sm_90a)."
+        ) from _flashmla_import_error
 
 
 def get_mla_metadata(
@@ -36,6 +59,8 @@ def get_mla_metadata(
         num_splits: (batch_size + 1), dtype torch.int32.
     """
     if is_fp8_kvcache and topk is None:
+        # Dense FP8 MLA requires flashmla_ops to be loaded successfully
+        _check_flashmla_ops_loaded()
         return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
             cache_seqlens,
             num_q_tokens_per_head_k,
