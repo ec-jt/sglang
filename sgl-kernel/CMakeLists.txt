@@ -381,6 +381,10 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
+# ============================ FlashMLA (Build First) ============================= #
+# Build FlashMLA first to catch any SM120 issues early
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
 Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
@@ -558,9 +562,6 @@ Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOAB
 target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
-
-# ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
 # ============================ Extra Install: DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.
