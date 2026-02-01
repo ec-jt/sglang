@@ -220,7 +220,9 @@ void cutlass_mla_decode(
     int64_t num_kv_splits) {
   auto sm_version = getSMVersion();
   // On SM103a, half of the accuracy tests are failing.
-  TORCH_CHECK(sm_version == 100, "cutlass_mla_decode is only supported on compute capability 10.0, but found sm version ", sm_version);
+  // SM120 (Blackwell GB200/RTX 5090) uses similar WGMMA instructions to SM100
+  // MODIFIED: Allow SM120 for FP8 KV cache support on Blackwell GPUs
+  TORCH_CHECK(sm_version == 100 || sm_version == 120, "cutlass_mla_decode is only supported on compute capability 10.0 or 12.0, but found sm version ", sm_version);
 
   auto in_dtype = q_nope.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
