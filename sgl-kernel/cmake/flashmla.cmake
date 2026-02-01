@@ -52,12 +52,13 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
     )
 endif()
 
-# DISABLED: SM100a (Blackwell B100/B200) - uncomment if needed
-# if(${CUDA_VERSION} VERSION_GREATER 12.8)
-#     list(APPEND FLASHMLA_CUDA_FLAGS
-#         "-gencode=arch=compute_100a,code=sm_100a"
-#     )
-# endif()
+# SM100a (Blackwell B100/B200) - REQUIRED for sm100/prefill/dense/ kernels
+# SM120 can run SM100a code via CUDA forward compatibility
+if(${CUDA_VERSION} VERSION_GREATER 12.8)
+    list(APPEND FLASHMLA_CUDA_FLAGS
+        "-gencode=arch=compute_100a,code=sm_100a"
+    )
+endif()
 
 # SM120a (GB200 / RTX 5090) - ENABLED
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
