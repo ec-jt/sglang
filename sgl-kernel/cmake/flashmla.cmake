@@ -38,11 +38,16 @@ set(FLASHMLA_CUDA_FLAGS
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
 
-# FlashMLA kernels support SM90a (Hopper), SM100a/SM103a (Blackwell), SM120a (GB200/RTX 5090)
+# FlashMLA kernels support SM90a (Hopper), SM100a/SM103a (Blackwell)
 #
 # IMPORTANT: SM90a gencode is REQUIRED for the dense_fp8 extension kernels which use
 # SM90-specific CUDA intrinsics (GMMA operations, SM90_U32x4_STSM_N, etc.)
-# SM120 can run SM90a code via compatibility mode, but the code must be compiled with SM90a gencode.
+#
+# SM120 (GB200/RTX 5090) SUPPORT:
+# We do NOT compile native SM120a code for FlashMLA kernels because:
+# 1. SM100 kernels use tcgen05.* (Tensor Core Gen 5) instructions not available on SM120
+# 2. Instead, SM120 runs SM100a PTX via CUDA JIT forward compatibility at runtime
+# 3. This is the standard CUDA forward compatibility mechanism
 
 # SM90a (Hopper H100/H200) - REQUIRED for dense_fp8 extension kernels
 # The extension/sm90/dense_fp8/ kernels use SM90 GMMA intrinsics that require SM90a gencode
@@ -53,19 +58,22 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
 endif()
 
 # SM100a (Blackwell B100/B200) - REQUIRED for sm100/prefill/dense/ kernels
-# SM120 can run SM100a code via CUDA forward compatibility
+# SM120 runs SM100a code via CUDA JIT forward compatibility at runtime
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )
 endif()
 
-# SM120a (GB200 / RTX 5090) - ENABLED
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_120a,code=sm_120a"
-    )
-endif()
+# SM120a (GB200 / RTX 5090) - DISABLED for FlashMLA
+# SM120 uses CUDA JIT forward compatibility to run SM100a PTX at runtime.
+# Native SM120a compilation fails because SM100 kernels use tcgen05.* instructions
+# that are not available on SM120.
+# if(${CUDA_VERSION} VERSION_GREATER 12.8)
+#     list(APPEND FLASHMLA_CUDA_FLAGS
+#         "-gencode=arch=compute_120a,code=sm_120a"
+#     )
+# endif()
 
 # DISABLED: SM103a (Blackwell B300) - uncomment if needed (requires CUDA 13+)
 # if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
