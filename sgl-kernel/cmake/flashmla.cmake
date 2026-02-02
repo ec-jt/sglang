@@ -92,6 +92,9 @@ set(FlashMLA_SOURCES
     ${FLASHMLA_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/splitkv_mla.cu
     ${FLASHMLA_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/decode/sparse_fp8/splitkv_mla.cu
+    # SM100 prefill kernels - these may fail to compile on some systems
+    # The stub file provides fallback symbols to allow the library to load
+    ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_sm100_stub.cpp
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu
