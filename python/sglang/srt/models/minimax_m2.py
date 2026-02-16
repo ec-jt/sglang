@@ -16,6 +16,7 @@
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
 import logging
+import re
 from contextlib import nullcontext
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -74,6 +75,8 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
 
 
 @triton.jit
@@ -443,14 +446,9 @@ class MiniMaxM2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            ctx = (
-                nullcontext()
-                if get_global_server_args().enable_piecewise_cuda_graph
-                else get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
-                )
-            )
-            with ctx:
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -481,14 +479,9 @@ class MiniMaxM2MoE(nn.Module):
     def op_dispatch_b(self, state):
         """Dispatch B operation for TBO - complete async dispatch"""
         if self.ep_size > 1:
-            ctx = (
-                nullcontext()
-                if get_global_server_args().enable_piecewise_cuda_graph
-                else get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
-                )
-            )
-            with ctx:
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
                 state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
@@ -638,8 +631,6 @@ class MiniMaxM2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            # q = self.q_norm(q.contiguous())
-            # k = self.k_norm(k.contiguous())
             q, k = MiniMaxM2RMSNormTP.forward_qk(
                 self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
             )
@@ -721,6 +712,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
+
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -755,7 +747,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
         # Fully Connected (MLP or MoE)
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -907,12 +898,7 @@ class MiniMaxM2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
-                ctx = (
-                    nullcontext()
-                    if get_global_server_args().enable_piecewise_cuda_graph
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
-                )
-                with ctx:
+                with get_global_expert_distribution_recorder().with_current_layer(i):
                     if i in self.layers_to_capture:
                         aux_hidden_states.append(hidden_states + residual)
                     layer = self.layers[i]
@@ -999,20 +985,71 @@ class MiniMaxM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
-        # _print_tensor_info(input_ids, "input_ids")
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        """
+        Pipeline-parallel aware forward:
+          - Non-first PP ranks take pp_proxy_tensors as input.
+          - Non-last PP ranks return PPProxyTensors and MUST NOT compute logits.
+          - Last PP rank computes logits via logits_processor.
+        """
+        pp_group = get_pp_group()
+
+        hidden_states_or_proxy = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        # Non-last PP stages must NOT compute logits / lm_head.
+        if pp_group is not None and not pp_group.is_last_rank:
+            return hidden_states_or_proxy
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+            hidden_states_or_proxy, aux_hidden_states = hidden_states_or_proxy
 
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            input_ids, hidden_states_or_proxy, self.lm_head, forward_batch, aux_hidden_states
         )
 
+    def _pp_should_skip_param(self, param_name: str) -> bool:
+        """
+        Return True if param_name is expected to be absent on this PP rank.
+        This avoids masking genuine mapping bugs while still allowing each PP
+        stage to ignore weights for other stages when the checkpoint iterator
+        feeds "all keys" to every rank.
+        """
+        pp_group = get_pp_group()
+        if pp_group is None or pp_group.world_size <= 1:
+            return False
+
+        # Layer weights: only [start_layer, end_layer) exist on this rank.
+        m = _LAYER_RE.match(param_name)
+        if m is not None:
+            layer_id = int(m.group(1))
+            return not (self.model.start_layer <= layer_id < self.model.end_layer)
+
+        # Embeddings live on the first stage.
+        if param_name.startswith("model.embed_tokens."):
+            return not pp_group.is_first_rank
+
+        # Final norm and lm_head live on the last stage.
+        if param_name.startswith("model.norm."):
+            return not pp_group.is_last_rank
+        if param_name.startswith("lm_head."):
+            return not pp_group.is_last_rank
+
+        # Everything else is expected to exist on all ranks (if present in this model).
+        return False
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load model weights with proper mapping for MiniMax architecture."""
+        """Load model weights with proper mapping for MiniMax architecture (PP-safe)."""
+
+        pp_group = get_pp_group()
+        is_pp = (pp_group is not None) and (pp_group.world_size > 1)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1034,7 +1071,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-        for name, loaded_weight in weights:
+
+        for orig_name, loaded_weight in weights:
+            name = orig_name
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -1042,60 +1082,92 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
+            handled = False
+
+            # ---- stacked params (qkv, gate/up merge) ----
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+
+                # Keep upstream behavior: skip expert tensors here BEFORE renaming
+                # to avoid creating bogus names like gate_gate_up_proj.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
 
-                param = params_dict[name]
+                mapped_name = name.replace(weight_name, param_name)
+
+                # Skip loading extra bias for GPTQ models.
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                    handled = True
+                    break
+
+                if mapped_name not in params_dict:
+                    if is_pp and self._pp_should_skip_param(mapped_name):
+                        handled = True
+                        break
+                    raise KeyError(mapped_name)
+
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(mapped_name)
+                handled = True
                 break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
 
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+            if handled:
+                continue
 
-                    # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
+            # ---- expert params mapping (MoE weights) ----
+            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                if weight_name not in name:
+                    continue
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                mapped_name = name.replace(weight_name, param_name)
+
+                if mapped_name not in params_dict:
+                    if is_pp and self._pp_should_skip_param(mapped_name):
+                        handled = True
+                        break
+                    raise KeyError(mapped_name)
+
+                param = params_dict[mapped_name]
+                weight_loader = param.weight_loader
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    mapped_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                loaded_params.add(mapped_name)
+                handled = True
+                break
+
+            if handled:
+                continue
+
+            # ---- everything else (embeddings, norms, lm_head, fp8 scales, etc.) ----
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            # Remapping the name of FP8 kv-scale.
+            remapped = maybe_remap_kv_scale_name(name, params_dict)
+            if remapped is None:
+                # Upstream behavior: unknown kv-scale names are ignored.
+                continue
+            name = remapped
+
+            if name not in params_dict:
+                if is_pp and self._pp_should_skip_param(name):
+                    continue
+                raise KeyError(name)
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
         return loaded_params
 
     @classmethod
