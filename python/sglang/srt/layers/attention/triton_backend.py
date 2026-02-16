@@ -63,6 +63,9 @@ class TritonAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
+        from sglang.srt.layers.attention.triton_ops.decode_attention_fp4 import (
+            decode_attention_fwd_fp4,
+        )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             build_unified_kv_indices,
             extend_attention_fwd,
@@ -72,6 +75,9 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.decode_attention_fwd_fp4 = torch.compiler.disable(
+            decode_attention_fwd_fp4
+        )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -1028,22 +1034,47 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            self.forward_metadata.attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        # Check if the KV pool is FP4 and use fused FP4 kernel
+        kv_pool = forward_batch.token_to_kv_pool
+        if getattr(kv_pool, "is_fp4", False):
+            # Use fused FP4 decode attention kernel (reads FP4 directly, no dequant)
+            k_fp4, k_scale = kv_pool.get_key_buffer_raw(layer.layer_id)
+            v_fp4, v_scale = kv_pool.get_value_buffer_raw(layer.layer_id)
+            self.decode_attention_fwd_fp4(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k_fp4,
+                k_scale,
+                v_fp4,
+                v_scale,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        else:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
         return o
 
 

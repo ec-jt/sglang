@@ -1039,6 +1039,26 @@ class MHATokenToKVPool(KVCache):
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
+    is_fp4 = True
+
+    def get_key_buffer_raw(self, layer_id: int):
+        """Return raw FP4 packed buffer and scale buffer without dequantization."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return (
+            self.k_buffer[layer_id - self.start_layer],
+            self.k_scale_buffer[layer_id - self.start_layer],
+        )
+
+    def get_value_buffer_raw(self, layer_id: int):
+        """Return raw FP4 packed buffer and scale buffer without dequantization."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return (
+            self.v_buffer[layer_id - self.start_layer],
+            self.v_scale_buffer[layer_id - self.start_layer],
+        )
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
