@@ -1513,6 +1513,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         return qkv_latent
 
     def forward_normal_prepare(
+        self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
