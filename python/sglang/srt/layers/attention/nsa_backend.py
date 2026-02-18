@@ -634,7 +634,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            except (ImportError, ModuleNotFoundError, RuntimeError):
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -916,7 +916,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            except (ImportError, ModuleNotFoundError, RuntimeError):
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -1089,7 +1089,7 @@ class NativeSparseAttnBackend(
                     metadata.paged_mqa_schedule_metadata = new_schedule
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            except (ImportError, ModuleNotFoundError, RuntimeError):
                 metadata.paged_mqa_schedule_metadata = None
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
@@ -2039,11 +2039,13 @@ class NativeSparseAttnBackend(
                 else self.nsa_index_topk
             )
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Requirements: H200/B200/GB200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only
+                    device_sm == 90
+                    or (device_sm >= 100 and device_sm < 110)
+                    or device_sm == 120
+                )  # SM90/SM100/SM120
                 and max_kv_len <= mha_max_kv_len  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
