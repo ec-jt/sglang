@@ -3808,3 +3808,32 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def check_pkg_version_at_least(pkg_name: str, min_version: str) -> bool:
+    """Return True if installed pkg version >= min_version."""
+    try:
+        from importlib.metadata import version as _version
+    except Exception:
+        return False
+
+    try:
+        got = _version(pkg_name)
+    except Exception:
+        return False
+
+    try:
+        from packaging.version import Version
+        return Version(got) >= Version(min_version)
+    except Exception:
+        # Fallback (rough)
+        return got >= min_version
+
+def get_quantization_config(*args, **kwargs):
+    """
+    Back-compat shim.
+    Newer server_args expects this helper to exist.
+    For kernel tuning / standalone scripts, returning None is usually fine.
+    """
+    return None
+
