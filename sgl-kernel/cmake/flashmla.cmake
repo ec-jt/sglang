@@ -102,6 +102,31 @@ if(${CUDA_VERSION} VERSION_GREATER 12.8)
     else()
         message(STATUS "cutlass/arch/config.h already patched for SM120a")
     endif()
+
+    # Patch python_api.cpp: Widen SM100 runtime checks to include SM120 (GB200 / RTX 5090)
+    # SM120 inherits SM100a ISA capabilities and uses SM100 CUDA kernels.
+    # Without this patch, get_mla_metadata() fails with "Only SM90 and SM100 are supported"
+    set(FLASHMLA_PYTHON_API_FILE "${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp")
+    file(READ "${FLASHMLA_PYTHON_API_FILE}" FLASHMLA_PYTHON_API_CONTENT)
+
+    # Patch 1: Widen Arch::is_sm100() to include SM120
+    string(REPLACE
+"    bool is_sm100() const {
+        return major == 10;
+    }"
+"    bool is_sm100() const {
+        return major == 10 || major == 12;  // SM120 (GB200) uses SM100 kernels
+    }"
+        FLASHMLA_PYTHON_API_CONTENT "${FLASHMLA_PYTHON_API_CONTENT}")
+
+    # Patch 2: Widen sparse_prefill_fwd standalone SM100 check to include SM120
+    string(REPLACE
+        "bool is_sm100 = dprops->major == 10;"
+        "bool is_sm100 = dprops->major == 10 || dprops->major == 12;  // SM120 (GB200) uses SM100 kernels"
+        FLASHMLA_PYTHON_API_CONTENT "${FLASHMLA_PYTHON_API_CONTENT}")
+
+    file(WRITE "${FLASHMLA_PYTHON_API_FILE}" "${FLASHMLA_PYTHON_API_CONTENT}")
+    message(STATUS "Patched python_api.cpp for SM120 (GB200) runtime support")
 endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
