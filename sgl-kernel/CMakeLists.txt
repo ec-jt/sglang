@@ -61,6 +61,38 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-deepgemm)
 
+# Patch DeepGEMM device_runtime.hpp for SM120a (Grace-Blackwell GB200) support
+# Maps SM120 (major=12) → SM100 in get_arch() and get_arch_major() so all
+# dispatch checks pass and JIT kernels compile for sm_100a on Blackwell GPUs.
+set(DG_DEVICE_RUNTIME_FILE "${repo-deepgemm_SOURCE_DIR}/csrc/jit/device_runtime.hpp")
+file(READ "${DG_DEVICE_RUNTIME_FILE}" DG_DEVICE_RUNTIME_CONTENT)
+
+string(FIND "${DG_DEVICE_RUNTIME_CONTENT}" "major == 12" DG_SM120_FOUND)
+if(DG_SM120_FOUND EQUAL -1)
+    # Patch get_arch(): change const auto& to auto so we can mutate, add SM120 remap
+    string(REPLACE
+        "const auto& [major, minor] = get_arch_pair()"
+        "auto [major, minor] = get_arch_pair()"
+        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
+
+    # Insert SM120→SM100 mapping before the SM100 check
+    string(REPLACE
+        "if (major == 10 and minor != 1)"
+        "if (major == 12) { major = 10; } // SM120 (GB200/RTX 5090) → SM100a\n        if (major == 10 and minor != 1)"
+        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
+
+    # Patch get_arch_major(): map SM120 (major=12) → 10
+    string(REPLACE
+        "return get_arch_pair().first;"
+        "{ auto m = get_arch_pair().first; return m == 12 ? 10 : m; }"
+        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
+
+    file(WRITE "${DG_DEVICE_RUNTIME_FILE}" "${DG_DEVICE_RUNTIME_CONTENT}")
+    message(STATUS "Patched DeepGEMM device_runtime.hpp for SM120a (GB200) support")
+else()
+    message(STATUS "DeepGEMM device_runtime.hpp already patched for SM120a")
+endif()
+
 # fmt
 FetchContent_Declare(
     repo-fmt
