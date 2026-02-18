@@ -62,34 +62,31 @@ FetchContent_Declare(
 FetchContent_Populate(repo-deepgemm)
 
 # Patch DeepGEMM device_runtime.hpp for SM120 (RTX 5090) support
-# Maps SM120 (major=12) → SM90 in get_arch() and get_arch_major() so
-# JIT kernels compile for sm_90a which SM120 can run via forward compat.
-# NOTE: SM120 CANNOT run SM100 cubins (different ISA: UMMA/TMEM vs WGMMA).
+# Strategy: get_arch() returns native "120a" so JIT compiles for sm_120a,
+#           get_arch_major() returns 9 so SM90 kernel source paths are used.
+# SM120 can compile SM90 kernel sources for its native arch (verified).
+# SM120 CANNOT load sm_90a or sm_100a cubins (different binary format).
 set(DG_DEVICE_RUNTIME_FILE "${repo-deepgemm_SOURCE_DIR}/csrc/jit/device_runtime.hpp")
 file(READ "${DG_DEVICE_RUNTIME_FILE}" DG_DEVICE_RUNTIME_CONTENT)
 
 string(FIND "${DG_DEVICE_RUNTIME_CONTENT}" "major == 12" DG_SM120_FOUND)
 if(DG_SM120_FOUND EQUAL -1)
-    # Patch get_arch(): change const auto& to auto so we can mutate, add SM120→SM90 remap
-    string(REPLACE
-        "const auto& [major, minor] = get_arch_pair()"
-        "auto [major, minor] = get_arch_pair()"
-        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-
-    # Insert SM120→SM90 mapping before the SM100 check
+    # Patch get_arch(): SM120 returns native "120a" (or "120" if number_only)
+    # so NVCC compiles cubins for sm_120a that can actually load on the device.
+    # Insert early return for SM120 before the SM100 check.
     string(REPLACE
         "if (major == 10 and minor != 1)"
-        "if (major == 12) { major = 9; minor = 0; } // SM120 (RTX 5090) → SM90a\n        if (major == 10 and minor != 1)"
+        "if (major == 12) { return std::to_string(major * 10 + minor) + (number_only ? \"\" : \"a\"); } // SM120: native arch cubin\n        if (major == 10 and minor != 1)"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
-    # Patch get_arch_major(): map SM120 (major=12) → 9 (SM90)
+    # Patch get_arch_major(): map SM120 (major=12) → 9 (SM90 kernel sources)
     string(REPLACE
         "return get_arch_pair().first;"
         "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
     file(WRITE "${DG_DEVICE_RUNTIME_FILE}" "${DG_DEVICE_RUNTIME_CONTENT}")
-    message(STATUS "Patched DeepGEMM device_runtime.hpp for SM120 (RTX 5090) → SM90a")
+    message(STATUS "Patched DeepGEMM device_runtime.hpp for SM120: native arch cubin + SM90 kernel paths")
 else()
     message(STATUS "DeepGEMM device_runtime.hpp already patched for SM120")
 endif()
