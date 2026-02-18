@@ -1070,6 +1070,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Precompute the kv indices for each chunk
         self.prepare_chunked_kv_indices(device)
 
+    def prepare_chunked_kv_indices(self, device: torch.device):
+        self.prefix_chunk_kv_indices = []
+        for idx in range(self.num_prefix_chunks):
+            chunk_starts = self.prefix_chunk_starts[idx]
+            chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
+            chunk_cu_seq_lens = self.prefix_chunk_cu_seq_lens[idx]
+            num_chunk_tokens = self.prefix_chunk_num_tokens[idx]
+
+            chunk_kv_indices = torch.empty(
+                num_chunk_tokens, dtype=torch.int32, device=device
+            )
+
+            create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                chunk_starts,
+                chunk_seq_lens,
+                chunk_cu_seq_lens,
+                chunk_kv_indices,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+            self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
@@ -1204,3 +1227,40 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+@triton.jit
+def create_chunked_prefix_cache_kv_indices(
+    req_to_token_ptr,  # (max_batch, max_context_len,)
+    req_pool_indices_ptr,  # (batch_size,)
+    chunk_start_idx_ptr,  # (batch_size,)
+    chunk_seq_lens_ptr,  # (batch_size,)
+    chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
+    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+
+    # find the req pool idx, this is for batch to token
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
+
+    # get the token positions of current chunk
+    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
+    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
+
+    num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < chunk_seq_len
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + chunk_start_pos
+            + offset,
+            mask=mask,
+        )
+        tl.store(
+            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
+        )
