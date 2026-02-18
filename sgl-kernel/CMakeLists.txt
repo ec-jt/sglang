@@ -69,8 +69,19 @@ FetchContent_Populate(repo-deepgemm)
 set(DG_DEVICE_RUNTIME_FILE "${repo-deepgemm_SOURCE_DIR}/csrc/jit/device_runtime.hpp")
 file(READ "${DG_DEVICE_RUNTIME_FILE}" DG_DEVICE_RUNTIME_CONTENT)
 
-string(FIND "${DG_DEVICE_RUNTIME_CONTENT}" "major == 12" DG_SM120_FOUND)
-if(DG_SM120_FOUND EQUAL -1)
+# Use specific marker to detect if NEW patch (native arch) is applied vs old (SM90 remap)
+string(FIND "${DG_DEVICE_RUNTIME_CONTENT}" "SM120: native arch cubin" DG_SM120_NATIVE_FOUND)
+if(DG_SM120_NATIVE_FOUND EQUAL -1)
+    # Remove old SM120→SM90 patch if present (from previous builds)
+    string(REPLACE
+        "if (major == 12) { major = 9; minor = 0; } // SM120 (RTX 5090) → SM90a\n        "
+        ""
+        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
+    # Remove old get_arch_major patch if present
+    string(REPLACE
+        "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
+        "return get_arch_pair().first;"
+        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
     # Patch get_arch(): SM120 returns native "120a" (or "120" if number_only)
     # so NVCC compiles cubins for sm_120a that can actually load on the device.
     # Insert early return for SM120 before the SM100 check.
