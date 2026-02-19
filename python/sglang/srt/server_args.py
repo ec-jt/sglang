@@ -1155,11 +1155,20 @@ class ServerArgs:
         user_set_decode = self.nsa_decode_backend is not None
 
         if kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            if major == 12:
+                # SM120 (RTX 5090): FlashMLA decode kernels use TCGEN05 (SM100) or
+                # WGMMA (SM90) instructions that SM120 does not support.
+                # Use TRT-LLM MLA decode which works via FlashInfer on SM120.
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "trtllm"
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
