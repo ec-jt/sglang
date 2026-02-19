@@ -52,57 +52,33 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-FetchContent_Declare(
-    repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-deepgemm)
-
-# Patch DeepGEMM device_runtime.hpp for SM120 (RTX 5090) support
-# Strategy: get_arch() returns native "120a" so JIT compiles for sm_120a,
-#           get_arch_major() returns 9 so SM90 kernel source paths are used.
-# SM120 can compile SM90 kernel sources for its native arch (verified).
-# SM120 CANNOT load sm_90a or sm_100a cubins (different binary format).
-set(DG_DEVICE_RUNTIME_FILE "${repo-deepgemm_SOURCE_DIR}/csrc/jit/device_runtime.hpp")
-file(READ "${DG_DEVICE_RUNTIME_FILE}" DG_DEVICE_RUNTIME_CONTENT)
-
-# Use specific marker to detect if NEW patch (native arch) is applied vs old (SM90 remap)
-string(FIND "${DG_DEVICE_RUNTIME_CONTENT}" "SM120: native arch cubin" DG_SM120_NATIVE_FOUND)
-if(DG_SM120_NATIVE_FOUND EQUAL -1)
-    # Remove old SM120→SM90 patch if present (from previous builds)
-    string(REPLACE
-        "if (major == 12) { major = 9; minor = 0; } // SM120 (RTX 5090) → SM90a\n        "
-        ""
-        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-    # Remove old get_arch_major patches if present (SM90 mapping)
-    string(REPLACE
-        "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
-        "return get_arch_pair().first;"
-        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-    # Patch get_arch(): SM120 maps entirely to SM100:
-    #   number_only=true  → "100" (selects SM100 kernel source .cuh files with UMMA/TMEM)
-    #   number_only=false → "100a" or "100f" (compile SM100 cubins that run on SM120 via compat)
-    # SM120 supports tcgen05/umma when compiled for sm_100a target.
-    # sm_120a does NOT support tcgen05 instructions.
-    string(REPLACE
-        "if (major == 10 and minor != 1)"
-        "if (major == 12) { if (number_only) return \"100\"; return support_arch_family ? \"100f\" : \"100a\"; } // SM120→SM100 compat\n        if (major == 10 and minor != 1)"
-        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-
-    # Patch get_arch_major(): map SM120 (major=12) → 10 (SM100 UMMA/TMEM kernel paths)
-    string(REPLACE
-        "return get_arch_pair().first;"
-        "{ auto m = get_arch_pair().first; return m == 12 ? 10 : m; }"
-        DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-
-    file(WRITE "${DG_DEVICE_RUNTIME_FILE}" "${DG_DEVICE_RUNTIME_CONTENT}")
-    message(STATUS "Patched DeepGEMM device_runtime.hpp for SM120: SM100 kernel sources + SM100 compilation target")
+# DeepGEMM — use local fork with full SM120 kernel support
+# The local DeepGEMM directory contains SM120-specific kernels that use
+# SM89 mma.sync (m16n8k32 e4m3) and SM80 mma.sync (m16n8k16 bf16)
+# instead of SM90 WGMMA which is not supported on SM120 (RTX 5090).
+# All SM120 changes are already applied in the source tree:
+#   - device_runtime.hpp: arch_major=12, get_arch="120"/"120a"
+#   - attention.hpp, gemm.hpp: arch_major==12 dispatch
+#   - sm120_fp8_*.cuh, sm120_bf16_gemm.cuh: SM120 device kernels
+#   - sm120_*.hpp: SM120 host-side dispatch
+#   - sm120.hpp: SM120 arch heuristics
+# Try multiple possible locations for the local DeepGEMM
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../DeepGEMM/csrc/jit/device_runtime.hpp")
+    set(repo-deepgemm_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../DeepGEMM")
+elseif(EXISTS "/app/DeepGEMM/csrc/jit/device_runtime.hpp")
+    set(repo-deepgemm_SOURCE_DIR "/app/DeepGEMM")
 else()
-    message(STATUS "DeepGEMM device_runtime.hpp already patched for SM120")
+    # Fallback: fetch from GitHub (without SM120 kernel support)
+    message(WARNING "Local DeepGEMM not found, fetching from GitHub (SM120 GEMM kernels will NOT be available)")
+    FetchContent_Declare(
+        repo-deepgemm
+        GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
+        GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-deepgemm)
 endif()
+message(STATUS "Using DeepGEMM at: ${repo-deepgemm_SOURCE_DIR}")
 
 # fmt
 FetchContent_Declare(
