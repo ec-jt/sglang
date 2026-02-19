@@ -82,13 +82,14 @@ if(DG_SM120_NATIVE_FOUND EQUAL -1)
         "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
         "return get_arch_pair().first;"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-    # Patch get_arch(): SM120 needs two different returns:
+    # Patch get_arch(): SM120 maps entirely to SM100:
     #   number_only=true  → "100" (selects SM100 kernel source .cuh files with UMMA/TMEM)
-    #   number_only=false → "120a" (NVCC --gpu-architecture for native cubin)
-    # SM120 is Blackwell like SM100, uses UMMA/TMEM (not SM90 WGMMA).
+    #   number_only=false → "100a" or "100f" (compile SM100 cubins that run on SM120 via compat)
+    # SM120 supports tcgen05/umma when compiled for sm_100a target.
+    # sm_120a does NOT support tcgen05 instructions.
     string(REPLACE
         "if (major == 10 and minor != 1)"
-        "if (major == 12) { if (number_only) return \"100\"; return std::to_string(major * 10 + minor) + \"a\"; } // SM120: native arch cubin\n        if (major == 10 and minor != 1)"
+        "if (major == 12) { if (number_only) return \"100\"; return support_arch_family ? \"100f\" : \"100a\"; } // SM120→SM100 compat\n        if (major == 10 and minor != 1)"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
     # Patch get_arch_major(): map SM120 (major=12) → 10 (SM100 UMMA/TMEM kernel paths)
@@ -98,7 +99,7 @@ if(DG_SM120_NATIVE_FOUND EQUAL -1)
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
     file(WRITE "${DG_DEVICE_RUNTIME_FILE}" "${DG_DEVICE_RUNTIME_CONTENT}")
-    message(STATUS "Patched DeepGEMM device_runtime.hpp for SM120: native arch cubin + SM90 kernel paths")
+    message(STATUS "Patched DeepGEMM device_runtime.hpp for SM120: SM100 kernel sources + SM100 compilation target")
 else()
     message(STATUS "DeepGEMM device_runtime.hpp already patched for SM120")
 endif()
