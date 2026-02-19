@@ -82,12 +82,12 @@ if(DG_SM120_NATIVE_FOUND EQUAL -1)
         "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
         "return get_arch_pair().first;"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-    # Patch get_arch(): SM120 returns native "120a" (or "120" if number_only)
-    # so NVCC compiles cubins for sm_120a that can actually load on the device.
-    # Insert early return for SM120 before the SM100 check.
+    # Patch get_arch(): SM120 needs two different returns:
+    #   number_only=true  → "90" (selects SM90 kernel source .cuh files)
+    #   number_only=false → "120a" (NVCC --gpu-architecture for native cubin)
     string(REPLACE
         "if (major == 10 and minor != 1)"
-        "if (major == 12) { return std::to_string(major * 10 + minor) + (number_only ? \"\" : \"a\"); } // SM120: native arch cubin\n        if (major == 10 and minor != 1)"
+        "if (major == 12) { if (number_only) return \"90\"; return std::to_string(major * 10 + minor) + \"a\"; } // SM120: native arch cubin\n        if (major == 10 and minor != 1)"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
     # Patch get_arch_major(): map SM120 (major=12) → 9 (SM90 kernel sources)
