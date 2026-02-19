@@ -77,23 +77,24 @@ if(DG_SM120_NATIVE_FOUND EQUAL -1)
         "if (major == 12) { major = 9; minor = 0; } // SM120 (RTX 5090) → SM90a\n        "
         ""
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
-    # Remove old get_arch_major patch if present
+    # Remove old get_arch_major patches if present (SM90 mapping)
     string(REPLACE
         "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
         "return get_arch_pair().first;"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
     # Patch get_arch(): SM120 needs two different returns:
-    #   number_only=true  → "90" (selects SM90 kernel source .cuh files)
+    #   number_only=true  → "100" (selects SM100 kernel source .cuh files with UMMA/TMEM)
     #   number_only=false → "120a" (NVCC --gpu-architecture for native cubin)
+    # SM120 is Blackwell like SM100, uses UMMA/TMEM (not SM90 WGMMA).
     string(REPLACE
         "if (major == 10 and minor != 1)"
-        "if (major == 12) { if (number_only) return \"90\"; return std::to_string(major * 10 + minor) + \"a\"; } // SM120: native arch cubin\n        if (major == 10 and minor != 1)"
+        "if (major == 12) { if (number_only) return \"100\"; return std::to_string(major * 10 + minor) + \"a\"; } // SM120: native arch cubin\n        if (major == 10 and minor != 1)"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
-    # Patch get_arch_major(): map SM120 (major=12) → 9 (SM90 kernel sources)
+    # Patch get_arch_major(): map SM120 (major=12) → 10 (SM100 UMMA/TMEM kernel paths)
     string(REPLACE
         "return get_arch_pair().first;"
-        "{ auto m = get_arch_pair().first; return m == 12 ? 9 : m; }"
+        "{ auto m = get_arch_pair().first; return m == 12 ? 10 : m; }"
         DG_DEVICE_RUNTIME_CONTENT "${DG_DEVICE_RUNTIME_CONTENT}")
 
     file(WRITE "${DG_DEVICE_RUNTIME_FILE}" "${DG_DEVICE_RUNTIME_CONTENT}")
