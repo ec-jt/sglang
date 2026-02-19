@@ -2454,7 +2454,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.dcp_kv_buffer = torch.empty(
                     (
                         forward_batch.seq_lens_sum,
-                        *forward_batch.token_to_kv_pool.get_key_buffer(self.start_layer).shape[1:],
+                        *forward_batch.token_to_kv_pool.get_key_buffer(0).shape[1:],
                     ),
                     dtype=self.kv_cache_dtype,
                     device=self.device,
