@@ -38,6 +38,6 @@ cmake.build-type = "Release"
 cmake.args = ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
 minimum-version = "build-system.requires"
 
-wheel.py-api = "cp310"
+wheel.py-api = ""
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]
