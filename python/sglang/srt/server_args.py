@@ -1150,19 +1150,25 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int, hf_config=None) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
+        # Check if the model has non-standard qk_nope_head_dim.
+        # FlashInfer's trtllm_batch_decode_with_kv_cache_mla only supports qk_nope_head_dim=128.
+        # FlashMLA decode (flashmla_kv) hardcodes head_size_k=576 (for DeepSeek V3 dims).
+        # Models like GLM-5 with qk_nope_head_dim=192 need flashmla_sparse decode (BF16 only).
+        qk_nope_head_dim = getattr(hf_config, "qk_nope_head_dim", 128) if hf_config else 128
+        trtllm_decode_supported = (qk_nope_head_dim == 128)
+
         if kv_cache_dtype == "fp8_e4m3":
             if major == 12:
-                # SM120 (RTX 5090): FlashMLA decode kernels use TCGEN05 (SM100) or
-                # WGMMA (SM90) instructions that SM120 does not support.
-                # Use TRT-LLM MLA decode which works via FlashInfer on SM120.
+                # SM120 (RTX 5090): Native FlashMLA kernels using mma.sync (<100KB smem).
+                # Use flashmla_auto for prefill and flashmla_kv for decode (same as SM90).
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "flashmla_auto"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "trtllm"
+                    self.nsa_decode_backend = "flashmla_kv"
             else:
                 # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
@@ -1170,12 +1176,28 @@ class ServerArgs:
                 if not user_set_decode:
                     self.nsa_decode_backend = "flashmla_kv"
         else:
-            # set prefill/decode backends based on hardware architecture.
-            if major >= 10:
+            # BF16 KV cache path
+            if major == 12:
+                # SM120: Native FlashMLA kernels using mma.sync (<100KB smem)
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "trtllm"
+                    self.nsa_decode_backend = "flashmla_sparse"
+            elif major >= 10:
+                # SM100/SM103 (Blackwell B200/B300)
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_sparse"
+                if not user_set_decode:
+                    if trtllm_decode_supported:
+                        self.nsa_decode_backend = "trtllm"
+                    else:
+                        # trtllm decode doesn't support qk_nope_head_dim != 128 (e.g. GLM-5).
+                        # Use flashmla_sparse which works with any head dim (BF16 only).
+                        self.nsa_decode_backend = "flashmla_sparse"
+                        logger.warning(
+                            f"Model has qk_nope_head_dim={qk_nope_head_dim} (not 128). "
+                            f"Using flashmla_sparse decode (trtllm only supports qk_nope_head_dim=128)."
+                        )
             else:
                 # Hopper defaults for bfloat16
                 if not user_set_prefill:
@@ -1270,7 +1292,7 @@ class ServerArgs:
 
                     major, _ = torch.cuda.get_device_capability()
                     self._set_default_nsa_kv_cache_dtype(major)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_nsa_backends(self.kv_cache_dtype, major, hf_config=hf_config)
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (

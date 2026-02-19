@@ -128,6 +128,10 @@ set(FlashMLA_SOURCES
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
     ${FLASHMLA_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu
+    # SM120 native kernels (mma.sync, <100KB smem)
+    ${FLASHMLA_SOURCE_DIR}/csrc/sm120/decode/dense/splitkv_mla.cu
+    ${FLASHMLA_SOURCE_DIR}/csrc/sm120/decode/sparse_fp8/splitkv_mla.cu
+    ${FLASHMLA_SOURCE_DIR}/csrc/sm120/prefill/sparse/fwd.cu
 
     ${FLASHMLA_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp
     ${FLASHMLA_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
@@ -139,6 +143,7 @@ target_compile_options(flashmla_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${FLASHML
 target_include_directories(flashmla_ops PRIVATE
     ${FLASHMLA_SOURCE_DIR}/csrc
     ${FLASHMLA_SOURCE_DIR}/csrc/sm90
+    ${FLASHMLA_SOURCE_DIR}/csrc/sm120
     ${FLASHMLA_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${FLASHMLA_SOURCE_DIR}/csrc/cutlass/include
     ${FLASHMLA_SOURCE_DIR}/csrc/cutlass/tools/util/include
