@@ -125,13 +125,18 @@ def concat_and_cast_mha_k_kernel(
     rope_stride0: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
-    head_range = tl.arange(0, head_cnt)
+    head_range = tl.arange(0, BLOCK_HEAD)
+    head_mask = head_range < head_cnt
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    nope_offs = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_offs < nope_dim
 
     src_nope_ptr = (
         k_nope_ptr
@@ -141,14 +146,30 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
+    combined_nope_mask = head_mask[:, None] & nope_mask[None, :]
+    src_nope = tl.load(src_nope_ptr, mask=combined_nope_mask, other=0.0)
+    tl.store(dst_nope_ptr, src_nope, mask=combined_nope_mask)
 
-    rope_offs = tl.arange(0, rope_dim)
+    rope_offs = tl.arange(0, BLOCK_ROPE)
+    rope_mask = rope_offs < rope_dim
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope)
+    combined_rope_mask = head_mask[:, None] & rope_mask[None, :]
+    src_rope = tl.load(src_rope_ptr, mask=combined_rope_mask, other=0.0)
+    tl.store(dst_rope_ptr, src_rope, mask=combined_rope_mask)
+
+
+def _next_power_of_2(n: int) -> int:
+    """Round up to the next power of 2."""
+    if n <= 0:
+        return 1
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    return n + 1
 
 
 def concat_and_cast_mha_k_triton(
@@ -172,13 +193,19 @@ def concat_and_cast_mha_k_triton(
 
     nope_dim = k_nope.shape[-1]
     rope_dim = k_rope.shape[-1]
+    head_cnt = k.shape[1]
     grid = (k.shape[0],)
+
+    # Triton requires tl.arange ranges to be powers of 2
+    BLOCK_NOPE = _next_power_of_2(nope_dim)
+    BLOCK_ROPE = _next_power_of_2(rope_dim)
+    BLOCK_HEAD = _next_power_of_2(head_cnt)
 
     concat_and_cast_mha_k_kernel[grid](
         k,
         k_nope,
         k_rope,
-        k.shape[1],
+        head_cnt,
         k.stride(0),
         k.stride(1),
         k_nope.stride(0),
@@ -186,6 +213,9 @@ def concat_and_cast_mha_k_triton(
         k_rope.stride(0),
         nope_dim,
         rope_dim,
+        BLOCK_NOPE,
+        BLOCK_ROPE,
+        BLOCK_HEAD,
     )
 
 
