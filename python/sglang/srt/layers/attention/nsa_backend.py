@@ -1744,11 +1744,10 @@ class NativeSparseAttnBackend(
             dcp_rank = get_dcp_rank()
             dcp_ws = get_dcp_world_size()
             is_local = (page_table_1 % dcp_ws) == dcp_rank
-            page_table_1 = torch.where(
-                is_local,
-                page_table_1 // dcp_ws,
-                torch.tensor(-1, dtype=page_table_1.dtype, device=page_table_1.device),
-            )
+            # Use in-place operations to avoid tensor creation during CUDA graph capture
+            local_page_table = page_table_1 // dcp_ws
+            local_page_table[~is_local] = -1
+            page_table_1 = local_page_table
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
