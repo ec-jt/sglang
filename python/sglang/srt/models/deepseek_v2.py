@@ -2099,12 +2099,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 if lse.dim() == 3:
                     lse = lse.squeeze(-1)  # [B, H, 1] -> [B, H]
                 with use_symmetric_memory(get_dcp_group()):
-                    attn_output = attn_output.view(
+                    attn_output = attn_output.reshape(
                         -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
                     ).clone(memory_format=torch.contiguous_format)
                     lse = lse.clone(memory_format=torch.contiguous_format)
                 attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        attn_output = attn_output.reshape(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
