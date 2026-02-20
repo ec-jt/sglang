@@ -96,6 +96,10 @@ class TritonAttnBackend(AttentionBackend):
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
+        # DCP: buffers must be sized for expanded heads (num_local_heads * dcp_world_size)
+        # because attn_mqa_for_dcp_decode uses all-gathered Q with expanded head count
+        dcp_ws = get_dcp_world_size()
+        self.max_num_head = self.num_head * dcp_ws if dcp_ws > 1 else self.num_head
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -363,12 +367,12 @@ class TritonAttnBackend(AttentionBackend):
                 bs = kv_indptr.shape[0] - 1
 
             attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+                (bs, self.max_num_head, self.max_kv_splits, self.v_head_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
             attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
+                (bs, self.max_num_head, self.max_kv_splits),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -528,12 +532,12 @@ class TritonAttnBackend(AttentionBackend):
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
+            (max_num_tokens, self.max_num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
         self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits),
+            (max_num_tokens, self.max_num_head, self.max_kv_splits),
             dtype=torch.float32,
             device=self.device,
         )
