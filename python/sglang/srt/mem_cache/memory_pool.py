@@ -1371,7 +1371,9 @@ class HybridLinearKVPool(KVCache):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def get_v_head_dim(self):
-        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        return self.full_kv_pool.get_value_buffer(
+            self.full_kv_pool.start_layer
+        ).shape[-1]
 
     def set_mla_kv_buffer(
         self,
