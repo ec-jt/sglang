@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
+from sglang.srt.distributed.parallel_state import get_dcp_world_size
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
@@ -1560,16 +1561,19 @@ class NativeSparseAttnBackend(
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            _return_lse = get_dcp_world_size() > 1
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=_return_lse,
             )
         elif self.nsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            _return_lse = get_dcp_world_size() > 1
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1579,6 +1583,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_lse=_return_lse,
             )
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
@@ -1665,7 +1670,8 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ):
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
@@ -1693,7 +1699,7 @@ class NativeSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, _, lse = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
@@ -1705,6 +1711,8 @@ class NativeSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
 
+        if return_lse:
+            return o, lse
         return o
 
     def _forward_flashmla_kv(
@@ -1716,7 +1724,8 @@ class NativeSparseAttnBackend(
         layer,
         metadata: NSAMetadata,
         page_table_1,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ):
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
@@ -1735,7 +1744,7 @@ class NativeSparseAttnBackend(
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
+        o, softmax_lse = flash_mla_with_kvcache(
             q=q_all,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -1750,6 +1759,8 @@ class NativeSparseAttnBackend(
             ),
             is_fp8_kvcache=True,
         )
+        if return_lse:
+            return o, softmax_lse
         return o
 
     def _forward_standard_mha(
