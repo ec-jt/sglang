@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
-from sglang.srt.distributed.parallel_state import get_dcp_world_size
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
@@ -415,6 +415,11 @@ class NativeSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
+            # DCP: adjust seqlens to reflect local KV cache shard
+            if get_dcp_world_size() > 1:
+                dcp_rank = get_dcp_rank()
+                dcp_world_size = get_dcp_world_size()
+                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
@@ -602,6 +607,11 @@ class NativeSparseAttnBackend(
             forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
+        # DCP: adjust seqlens for extend mode to reflect local KV cache shard
+        if get_dcp_world_size() > 1 and forward_batch.forward_mode.is_extend():
+            dcp_rank = get_dcp_rank()
+            dcp_world_size = get_dcp_world_size()
+            seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
             nsa_index_topk=self.nsa_index_topk,
@@ -814,11 +824,17 @@ class NativeSparseAttnBackend(
 
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
-            nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
-            )
 
+            # DCP: adjust seqlens to reflect local KV cache shard
             seqlens_expanded = cache_seqlens_int32
+            if get_dcp_world_size() > 1:
+                dcp_rank = get_dcp_rank()
+                dcp_world_size = get_dcp_world_size()
+                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
+
+            nsa_cache_seqlens_int32 = compute_nsa_seqlens(
+                seqlens_expanded, nsa_index_topk=self.nsa_index_topk
+            )
             nsa_extend_seq_lens_list = [1] * num_tokens
             if self.nsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
@@ -974,11 +990,18 @@ class NativeSparseAttnBackend(
             )
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
+
+            # DCP: adjust seqlens to reflect local KV cache shard
+            seqlens_expanded = cache_seqlens
+            if get_dcp_world_size() > 1:
+                dcp_rank = get_dcp_rank()
+                dcp_world_size = get_dcp_world_size()
+                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
+
             nsa_cache_seqlens = compute_nsa_seqlens(
-                cache_seqlens, nsa_index_topk=self.nsa_index_topk
+                seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
-            seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
             max_seqlen_k = int(
                 seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
@@ -1372,7 +1395,11 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        # DCP: use all-gathered KV buffer for prefill if available
+        if forward_batch.forward_mode.is_extend() and getattr(forward_batch, 'dcp_kv_buffer', None) is not None:
+            kv_cache = forward_batch.dcp_kv_buffer.to(q.dtype)
+        else:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1558,6 +1585,10 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
+        # DCP: remap global KV indices to local buffer positions
+        if get_dcp_world_size() > 1:
+            page_table_1 = page_table_1 // get_dcp_world_size()
+
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1712,6 +1743,11 @@ class NativeSparseAttnBackend(
             o = o[:, :num_heads, :]
 
         if return_lse:
+            # Ensure LSE is [B, H] for cp_lse_ag_out_rs
+            if lse.dim() == 3:
+                lse = lse.squeeze(-1)  # [B, H, 1] -> [B, H]
+            if need_padding:
+                lse = lse[:, :num_heads]
             return o, lse
         return o
 
@@ -1760,6 +1796,11 @@ class NativeSparseAttnBackend(
             is_fp8_kvcache=True,
         )
         if return_lse:
+            # Ensure LSE is [B, H] for cp_lse_ag_out_rs
+            if softmax_lse.dim() == 3:
+                softmax_lse = softmax_lse.squeeze(-1)  # [B, H, 1] -> [B, H]
+            if softmax_lse.dim() == 4:
+                softmax_lse = softmax_lse.squeeze(1).squeeze(-1)  # [B, 1, H, 1] -> [B, H]
             return o, softmax_lse
         return o
 
