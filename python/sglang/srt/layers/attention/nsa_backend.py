@@ -276,6 +276,25 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
+        # DCP: remap page table so local position i maps to the KV buffer index
+        # for local token i (= global token i * dcp_world_size + dcp_rank).
+        # The logits from the indexer are indexed by local position, but the global
+        # page table is indexed by global position.
+        if self.is_dcp_active():
+            from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
+            dcp_rank = get_dcp_rank()
+            dcp_world_size = get_dcp_world_size()
+            B, max_global_len = page_table_size_1.shape
+            max_local_len = logits.shape[1]
+            # Build local indices: [0*dcp_world_size+dcp_rank, 1*dcp_world_size+dcp_rank, ...]
+            local_to_global = torch.arange(
+                max_local_len, device=page_table_size_1.device
+            ) * dcp_world_size + dcp_rank
+            # Clamp to valid range
+            local_to_global = local_to_global.clamp(max=max_global_len - 1)
+            # Gather: page_table_size_1[:, local_to_global]
+            page_table_size_1 = page_table_size_1[:, local_to_global]
+
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
@@ -441,12 +460,14 @@ class NativeSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
-            # NOTE: With DCP + distributed top-K, seqlens_expanded stays GLOBAL.
-            # The distributed top-K in the indexer all-gathers logits across DCP ranks
-            # and selects from the global sequence, so nsa_cache_seqlens_int32 must
-            # reflect the global sequence length (clamped to topk).
-            # The local KV cache seqlens for the indexer are computed separately
-            # as indexer_cache_seqlens_int32.
+            # DCP: adjust seqlens to reflect local KV cache shard.
+            # Each rank selects local top-K from its local shard, and
+            # nsa_cache_seqlens_int32 = min(local_seqlen, topk) tells the
+            # FlashMLA kernel how many valid entries are in page_table_1.
+            if get_dcp_world_size() > 1:
+                dcp_rank = get_dcp_rank()
+                dcp_world_size = get_dcp_world_size()
+                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
@@ -867,9 +888,12 @@ class NativeSparseAttnBackend(
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
 
-            # NOTE: With DCP + distributed top-K, seqlens_expanded stays GLOBAL.
-            # Must be consistent with init_forward_metadata decode path.
+            # DCP: adjust seqlens to reflect local KV cache shard.
             seqlens_expanded = cache_seqlens_int32
+            if get_dcp_world_size() > 1:
+                dcp_rank = get_dcp_rank()
+                dcp_world_size = get_dcp_world_size()
+                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
 
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
@@ -1044,9 +1068,12 @@ class NativeSparseAttnBackend(
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
 
-            # NOTE: With DCP + distributed top-K, seqlens_expanded stays GLOBAL.
-            # Must be consistent with init_forward_metadata decode path.
+            # DCP: adjust seqlens to reflect local KV cache shard.
             seqlens_expanded = cache_seqlens
+            if get_dcp_world_size() > 1:
+                dcp_rank = get_dcp_rank()
+                dcp_world_size = get_dcp_world_size()
+                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
 
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
@@ -1651,22 +1678,11 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
-        # DCP: filter and remap global KV indices to local buffer positions.
-        # With distributed top-K, page_table_1 contains global KV buffer indices.
-        # Each rank only owns tokens where loc % dcp_world_size == dcp_rank.
-        # Entries for tokens on other ranks are set to -1 (skipped by FlashMLA).
-        # NOTE: Avoid torch.tensor() creation — not allowed during CUDA graph capture.
+        # DCP: remap global KV buffer indices to local buffer positions.
+        # With local top-K + local page table remapping in topk_transform,
+        # all entries in page_table_1 belong to this rank, so simple division works.
         if get_dcp_world_size() > 1:
-            dcp_world_size = get_dcp_world_size()
-            dcp_rank = get_dcp_rank()
-            # Remap all entries: divide by dcp_world_size (for local entries this gives
-            # the correct local position; for non-local entries the value doesn't matter
-            # since we'll overwrite with -1)
-            local_indices = page_table_1 // dcp_world_size
-            # Mark non-local entries as -1: entries where loc % dcp_world_size != dcp_rank
-            # (but preserve existing -1 entries)
-            is_non_local = (page_table_1 >= 0) & (page_table_1 % dcp_world_size != dcp_rank)
-            page_table_1 = torch.where(is_non_local, -1, local_indices)
+            page_table_1 = page_table_1 // get_dcp_world_size()
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
