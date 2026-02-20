@@ -775,6 +775,15 @@ class NativeSparseAttnBackend(
             indexer_real_page_table = self._build_dcp_local_real_page_table(
                 page_table, indexer_cache_seqlens_int32, dcp_rank, dcp_world_size
             )
+            # DCP: recompute schedule metadata with local seqlens for the indexer
+            if paged_mqa_schedule_metadata is not None:
+                try:
+                    import deep_gemm
+                    paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        indexer_cache_seqlens_int32, 64, deep_gemm.get_num_sms()
+                    )
+                except (ImportError, ModuleNotFoundError, RuntimeError):
+                    pass
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
@@ -1094,6 +1103,15 @@ class NativeSparseAttnBackend(
             if local_table.shape[1] > 0:
                 cols = min(local_table.shape[1], max_local_pages)
                 indexer_real_page_table[:, :cols] = local_table[:, :cols]
+            # DCP: recompute schedule metadata with local seqlens for the indexer
+            if paged_mqa_schedule_metadata is not None:
+                try:
+                    import deep_gemm
+                    paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        indexer_cache_seqlens_int32, 64, deep_gemm.get_num_sms()
+                    )
+                except (ImportError, ModuleNotFoundError, RuntimeError):
+                    pass
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
@@ -1319,6 +1337,16 @@ class NativeSparseAttnBackend(
                 (metadata.cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
             metadata.indexer_cache_seqlens_int32.copy_(indexer_local_seqlens)
+            # DCP: recompute schedule metadata with local seqlens for the indexer
+            if metadata.paged_mqa_schedule_metadata is not None:
+                try:
+                    import deep_gemm
+                    new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                        indexer_local_seqlens, 64, deep_gemm.get_num_sms()
+                    )
+                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                except (ImportError, ModuleNotFoundError, RuntimeError):
+                    pass
             if metadata.indexer_real_page_table is not None:
                 # Use the full pre-allocated page_table_1 (not the trimmed page_indices)
                 # because local_token_indices may exceed page_indices.shape[1]
