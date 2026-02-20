@@ -1520,10 +1520,12 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
-        valid_mask = loc % get_dcp_world_size() == get_dcp_rank()
-        if not valid_mask.all():
-            loc = loc[valid_mask]
-            cache_k = cache_k[valid_mask]
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            valid_mask = loc % dcp_world_size == get_dcp_rank()
+            if not valid_mask.all():
+                loc = loc[valid_mask]
+                cache_k = cache_k[valid_mask]
 
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
