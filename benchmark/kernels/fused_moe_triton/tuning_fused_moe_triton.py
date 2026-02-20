@@ -310,7 +310,6 @@ class BenchmarkWorker:
         assert best_config is not None
         return best_config
 
-
 def main(args: argparse.Namespace):
     print(args)
 
@@ -318,12 +317,20 @@ def main(args: argparse.Namespace):
         args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
     )
 
+    # Start from model defaults
     E = model_config["num_experts"]
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
     shard_intermediate_size = model_config["shard_intermediate_size"]
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
+
+    # Apply overrides
+    if args.E is not None:
+        E = args.E
+    if args.N is not None:
+        # N in filename is shard_intermediate_size//2
+        shard_intermediate_size = 2 * args.N
 
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
@@ -439,6 +446,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tp-size", "--tp", type=int, default=2)
     parser.add_argument("--ep-size", "--ep", type=int, default=1)
+    parser.add_argument("--E", type=int, default=None)
+    parser.add_argument("--N", type=int, default=None)
     parser.add_argument(
         "--dtype",
         type=str,
