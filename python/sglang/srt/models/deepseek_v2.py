@@ -2099,14 +2099,39 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+                # DCP decode: Q was all-gathered to num_local_heads * dcp_world_size.
+                # Use attn_mqa_for_dcp_decode which has the expanded head count so
+                # the triton backend reshapes Q correctly (batch dim stays as bs).
+                # Returns (output, lse) for LSE correction across DCP ranks.
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                )
+            elif forward_batch.forward_mode.is_extend() and get_dcp_world_size() > 1 and self.use_nsa:
+                # DCP+NSA extend: Q was all-gathered, use expanded-head attention.
+                # Returns (output, lse) for LSE correction across DCP ranks.
+                attn_output, lse = self.attn_mqa_for_dcp_extend(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                )
         # DCP LSE correction: merge partial attention outputs across DCP ranks.
         # Both decode and extend+NSA use expanded-head attention (num_local_heads * dcp_world_size)
         # and return (output, lse). cp_lse_ag_out_rs all-gathers LSE, corrects outputs,
