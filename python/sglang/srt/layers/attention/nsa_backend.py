@@ -1651,9 +1651,19 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
-        # DCP: remap global KV indices to local buffer positions
+        # DCP: filter and remap global KV indices to local buffer positions.
+        # With distributed top-K, page_table_1 contains global KV buffer indices.
+        # Each rank only owns tokens where loc % dcp_world_size == dcp_rank.
+        # Entries for tokens on other ranks are set to -1 (skipped by FlashMLA).
         if get_dcp_world_size() > 1:
-            page_table_1 = page_table_1 // get_dcp_world_size()
+            dcp_world_size = get_dcp_world_size()
+            dcp_rank = get_dcp_rank()
+            is_local = (page_table_1 % dcp_world_size == dcp_rank) | (page_table_1 == -1)
+            page_table_1 = torch.where(
+                is_local,
+                torch.where(page_table_1 >= 0, page_table_1 // dcp_world_size, page_table_1),
+                torch.tensor(-1, dtype=page_table_1.dtype, device=page_table_1.device),
+            )
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
