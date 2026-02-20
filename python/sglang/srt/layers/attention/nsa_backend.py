@@ -150,6 +150,12 @@ class NSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    # DCP-adjusted fields for the NSA indexer.
+    # The indexer's index_k_with_scale_buffer stores data at local positions
+    # (loc // dcp_world_size), so the indexer needs local seqlens and page tables.
+    indexer_cache_seqlens_int32: Optional[torch.Tensor] = None
+    indexer_real_page_table: Optional[torch.Tensor] = None
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -186,9 +192,17 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
+        # For DCP, the indexer needs local seqlens since the index_k_with_scale_buffer
+        # stores data at local positions (loc // dcp_world_size).
+        if self.attn_metadata.indexer_cache_seqlens_int32 is not None:
+            return self.attn_metadata.indexer_cache_seqlens_int32
         return self.attn_metadata.cache_seqlens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
+        # For DCP, the indexer needs local page table since the index_k_with_scale_buffer
+        # stores data at local page positions (page_index // dcp_world_size).
+        if self.attn_metadata.indexer_real_page_table is not None:
+            return self.attn_metadata.indexer_real_page_table
         return self.attn_metadata.real_page_table
 
     def get_page_table_1(self) -> torch.Tensor:
@@ -648,6 +662,19 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError, RuntimeError):
                 paged_mqa_schedule_metadata = None
 
+        # DCP: compute indexer-specific local seqlens and page table
+        dcp_world_size = get_dcp_world_size()
+        real_page_table = self._transform_table_1_to_real(page_table)
+        if dcp_world_size > 1:
+            dcp_rank = get_dcp_rank()
+            indexer_cache_seqlens_int32 = (
+                (cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
+            ).clamp_(min=0)
+            indexer_real_page_table = real_page_table // dcp_world_size
+        else:
+            indexer_cache_seqlens_int32 = None
+            indexer_real_page_table = None
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -672,12 +699,14 @@ class NativeSparseAttnBackend(
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
             nsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            real_page_table=real_page_table,
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             token_to_batch_idx=token_to_batch_idx,
+            indexer_cache_seqlens_int32=indexer_cache_seqlens_int32,
+            indexer_real_page_table=indexer_real_page_table,
         )
         self.forward_metadata = metadata
 
@@ -936,6 +965,18 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError, RuntimeError):
                 paged_mqa_schedule_metadata = None
 
+        # DCP: compute indexer-specific local seqlens and page table
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            dcp_rank = get_dcp_rank()
+            indexer_cache_seqlens_int32 = (
+                (cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
+            ).clamp_(min=0)
+            indexer_real_page_table = real_page_table // dcp_world_size
+        else:
+            indexer_cache_seqlens_int32 = None
+            indexer_real_page_table = None
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -952,6 +993,8 @@ class NativeSparseAttnBackend(
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
+            indexer_cache_seqlens_int32=indexer_cache_seqlens_int32,
+            indexer_real_page_table=indexer_real_page_table,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -1146,6 +1189,22 @@ class NativeSparseAttnBackend(
                     seq_len_q=1,
                 )
             )
+
+        # DCP: update indexer-specific local seqlens and page table
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1 and metadata.indexer_cache_seqlens_int32 is not None:
+            dcp_rank = get_dcp_rank()
+            indexer_local_seqlens = (
+                (metadata.cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
+            ).clamp_(min=0)
+            metadata.indexer_cache_seqlens_int32.copy_(indexer_local_seqlens)
+            if metadata.indexer_real_page_table is not None and self.real_page_size > 1:
+                real_table = self._transform_table_1_to_real(page_indices)
+                new_rows = real_table.shape[0]
+                new_cols = real_table.shape[1]
+                metadata.indexer_real_page_table[:new_rows, :new_cols].copy_(
+                    real_table // dcp_world_size
+                )
 
         self.forward_metadata = metadata
 
@@ -2147,10 +2206,21 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
+        # When DCP is active, the precomputed paged_mqa_schedule_metadata was computed
+        # with global seqlens but the indexer needs local seqlens. Pass None so the
+        # indexer recomputes the schedule with the correct local seqlens from
+        # get_seqlens_int32(). The recomputation is a lightweight CPU-side metadata call,
+        # not a GPU kernel, so the overhead is negligible.
+        dcp_world_size = get_dcp_world_size()
+        schedule_metadata = (
+            None
+            if dcp_world_size > 1
+            else self.forward_metadata.paged_mqa_schedule_metadata
+        )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(),
-            paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            paged_mqa_schedule_metadata=schedule_metadata,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
