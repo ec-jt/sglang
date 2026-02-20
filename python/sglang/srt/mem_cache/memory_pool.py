@@ -1886,20 +1886,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        # DCP filtering and remapping: the index_k_with_scale_buffer is a paged
-        # buffer that does NOT have DCP-aware triton kernels (unlike set_mla_kv_buffer).
-        # We must filter to only local tokens and remap loc to local buffer positions.
-        # NOTE: Always apply filtering unconditionally (no .all() check) to avoid
-        # CUDA synchronization which is not allowed during CUDA graph capture.
-        dcp_world_size = get_dcp_world_size()
-        if dcp_world_size > 1:
-            dcp_rank = get_dcp_rank()
-            valid_mask = loc % dcp_world_size == dcp_rank
-            loc = loc[valid_mask]
-            index_k = index_k[valid_mask]
-            index_k_scale = index_k_scale[valid_mask]
-            # Remap global loc to local buffer positions
-            loc = loc // dcp_world_size
+        # DCP filtering and remapping is handled inside the triton kernel
+        # (_set_k_and_s_triton_kernel) via DCP_RANK/DCP_WORLD_SIZE constexpr params.
+        # This avoids CUDA graph capture incompatibility with Python-level boolean masking.
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale

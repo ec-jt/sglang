@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
 
@@ -395,6 +396,8 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        DCP_RANK=get_dcp_rank(),
+        DCP_WORLD_SIZE=get_dcp_world_size(),
     )
 
 
@@ -410,10 +413,17 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
     loc = tl.load(loc_ptr + token_id)
+
+    # DCP filtering: only write tokens belonging to this rank, remap to local buffer
+    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
@@ -421,8 +431,8 @@ def _set_k_and_s_triton_kernel(
     k = tl.load(index_k_ptr + in_k_offsets)
     k_scale = tl.load(index_k_scale_ptr + token_id)
 
-    loc_page_index = loc // PAGE_SIZE
-    loc_token_offset_in_page = loc % PAGE_SIZE
+    loc_page_index = safe_loc // PAGE_SIZE
+    loc_token_offset_in_page = safe_loc % PAGE_SIZE
 
     out_k_offsets = (
         loc_page_index * BUF_NUMEL_PER_PAGE
@@ -437,8 +447,8 @@ def _set_k_and_s_triton_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
-    tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+    tl.store(buf_fp8_ptr + out_k_offsets, k, mask=is_valid)
+    tl.store(buf_fp32_ptr + out_s_offset, k_scale, mask=is_valid)
 
 
 def _get_k_triton(
