@@ -439,8 +439,46 @@ class Indexer(MultiPlatformOp):
                 clean_logits=False,
             )
 
+        # DCP: distributed top-K — all-gather local logits across DCP ranks,
+        # interleave to reconstruct global logits, then compute global top-K.
+        # This is necessary because each DCP rank only has 1/N of the KV cache,
+        # so local top-K ≠ global top-K.
+        dcp_global_seqlens = None
+        if metadata.is_dcp_active():
+            from sglang.srt.distributed import get_dcp_group, get_dcp_rank, get_dcp_world_size
+
+            dcp_group = get_dcp_group()
+            dcp_rank = get_dcp_rank()
+            dcp_world_size = get_dcp_world_size()
+
+            # logits shape: [B, local_max_seq_len] where local positions map to
+            # global positions: local_pos * dcp_world_size + dcp_rank
+            B, local_max_seq = logits.shape
+            global_max_seq = local_max_seq * dcp_world_size
+
+            # All-gather logits from all DCP ranks: [dcp_world_size, B, local_max_seq]
+            gathered = dcp_group.all_gather(logits, dim=0).view(
+                dcp_world_size, B, local_max_seq
+            )
+
+            # Interleave to reconstruct global order:
+            # global_logits[:, rank::dcp_world_size] = gathered[rank]
+            global_logits = torch.full(
+                (B, global_max_seq), float("-inf"),
+                device=logits.device, dtype=logits.dtype,
+            )
+            for r in range(dcp_world_size):
+                global_logits[:, r::dcp_world_size] = gathered[r]
+
+            logits = global_logits
+            # Use global seqlens for topk_transform (not DCP-adjusted)
+            dcp_global_seqlens = metadata.get_global_seqlens_int32()
+
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = metadata.topk_transform(
+            logits, self.index_topk,
+            ke_offset=dcp_global_seqlens,
+        )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset

@@ -198,12 +198,24 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             return self.attn_metadata.indexer_cache_seqlens_int32
         return self.attn_metadata.cache_seqlens_int32
 
+    def get_global_seqlens_int32(self) -> torch.Tensor:
+        """Return global (non-DCP-adjusted) seqlens for distributed top-K."""
+        return self.attn_metadata.cache_seqlens_int32
+
     def get_page_table_64(self) -> torch.Tensor:
         # For DCP, the indexer needs local page table since the index_k_with_scale_buffer
         # stores data at local page positions (page_index // dcp_world_size).
         if self.attn_metadata.indexer_real_page_table is not None:
             return self.attn_metadata.indexer_real_page_table
         return self.attn_metadata.real_page_table
+
+    def get_global_page_table_64(self) -> torch.Tensor:
+        """Return global (non-DCP-adjusted) page table for distributed top-K."""
+        return self.attn_metadata.real_page_table
+
+    def is_dcp_active(self) -> bool:
+        """Check if DCP is active (indexer has local metadata)."""
+        return self.attn_metadata.indexer_cache_seqlens_int32 is not None
 
     def get_page_table_1(self) -> torch.Tensor:
         return self.attn_metadata.page_table_1
