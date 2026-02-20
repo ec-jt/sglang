@@ -441,11 +441,12 @@ class NativeSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
-            # DCP: adjust seqlens to reflect local KV cache shard
-            if get_dcp_world_size() > 1:
-                dcp_rank = get_dcp_rank()
-                dcp_world_size = get_dcp_world_size()
-                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
+            # NOTE: With DCP + distributed top-K, seqlens_expanded stays GLOBAL.
+            # The distributed top-K in the indexer all-gathers logits across DCP ranks
+            # and selects from the global sequence, so nsa_cache_seqlens_int32 must
+            # reflect the global sequence length (clamped to topk).
+            # The local KV cache seqlens for the indexer are computed separately
+            # as indexer_cache_seqlens_int32.
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
@@ -866,12 +867,9 @@ class NativeSparseAttnBackend(
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
 
-            # DCP: adjust seqlens to reflect local KV cache shard
+            # NOTE: With DCP + distributed top-K, seqlens_expanded stays GLOBAL.
+            # Must be consistent with init_forward_metadata decode path.
             seqlens_expanded = cache_seqlens_int32
-            if get_dcp_world_size() > 1:
-                dcp_rank = get_dcp_rank()
-                dcp_world_size = get_dcp_world_size()
-                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
 
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
@@ -1046,12 +1044,9 @@ class NativeSparseAttnBackend(
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
 
-            # DCP: adjust seqlens to reflect local KV cache shard
+            # NOTE: With DCP + distributed top-K, seqlens_expanded stays GLOBAL.
+            # Must be consistent with init_forward_metadata decode path.
             seqlens_expanded = cache_seqlens
-            if get_dcp_world_size() > 1:
-                dcp_rank = get_dcp_rank()
-                dcp_world_size = get_dcp_world_size()
-                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
 
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
