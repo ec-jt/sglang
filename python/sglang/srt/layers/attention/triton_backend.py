@@ -297,13 +297,13 @@ class TritonAttnBackend(AttentionBackend):
         else:
             filtered_kv_indices = kv_indices[filter_positions] // dcp_world_size
 
-        # Build new kv_indptr from local lengths.
-        # Write in-place into the passed-in kv_indptr (which is a view of self.kv_indptr)
-        # so that CUDA graph replay uses the same memory address as capture.
-        kv_indptr[0] = 0
-        kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0).to(torch.int32)
+        # Build new kv_indptr from local lengths
+        new_kv_indptr = kv_indptr.clone()
+        new_kv_indptr[0] = 0
+        new_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0).to(torch.int32)
+        new_kv_indptr = new_kv_indptr[: bs + 1]
 
-        return filtered_kv_indices, kv_indptr
+        return filtered_kv_indices, new_kv_indptr
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
