@@ -1076,9 +1076,24 @@ class NativeSparseAttnBackend(
             indexer_cache_seqlens_int32 = (
                 (cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
-            indexer_real_page_table = self._build_dcp_local_real_page_table(
+            # For CUDA graph capture, allocate with max possible local size
+            # so that replay can always fit within the pre-allocated tensor.
+            page_size = self.real_page_size
+            max_local_seqlen = (self.max_context_len + dcp_world_size - 1) // dcp_world_size
+            if page_size > 1:
+                max_local_pages = (max_local_seqlen + page_size - 1) // page_size
+            else:
+                max_local_pages = max_local_seqlen
+            indexer_real_page_table = torch.zeros(
+                bs, max_local_pages, dtype=torch.int32, device=self.device
+            )
+            # Fill with actual data from warmup
+            local_table = self._build_dcp_local_real_page_table(
                 page_table_1, indexer_cache_seqlens_int32, dcp_rank, dcp_world_size
             )
+            if local_table.shape[1] > 0:
+                cols = min(local_table.shape[1], max_local_pages)
+                indexer_real_page_table[:, :cols] = local_table[:, :cols]
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
