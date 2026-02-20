@@ -422,6 +422,74 @@ class NativeSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    def _build_dcp_local_real_page_table(
+        self,
+        page_table_1: torch.Tensor,
+        indexer_cache_seqlens_int32: torch.Tensor,
+        dcp_rank: int,
+        dcp_world_size: int,
+    ) -> torch.Tensor:
+        """Build a correctly-shaped local page table for the indexer under DCP.
+
+        The index K cache stores data at local positions (loc // dcp_world_size).
+        With page_size=64, the local page index is (loc // dcp_world_size) // 64.
+
+        The global page table has shape [B, max_global_seqlen] but the indexer
+        needs a table with shape [B, max_local_pages] where each entry is a
+        local page index. This method:
+        1. Selects this rank's token positions from the global page_table_1
+        2. Converts global locs to local buffer positions
+        3. Converts to page-level indices (every page_size-th entry // page_size)
+        """
+        page_size = self.real_page_size
+        if page_size == 1:
+            # page_size=1: just select this rank's positions and remap
+            max_local_seqlen = int(indexer_cache_seqlens_int32.max().item())
+            if max_local_seqlen == 0:
+                return page_table_1[:, :0]
+            local_token_indices = (
+                torch.arange(max_local_seqlen, device=page_table_1.device)
+                * dcp_world_size
+                + dcp_rank
+            )
+            local_token_indices = local_token_indices.clamp(
+                max=page_table_1.shape[1] - 1
+            )
+            local_locs = page_table_1[:, local_token_indices]
+            return local_locs // dcp_world_size
+
+        # page_size > 1 (typically 64):
+        # Compute max local seqlen and derive local page count
+        max_local_seqlen = int(indexer_cache_seqlens_int32.max().item())
+        if max_local_seqlen == 0:
+            return page_table_1.new_zeros(page_table_1.shape[0], 0)
+        max_local_pages = (max_local_seqlen + page_size - 1) // page_size
+
+        # Select this rank's token positions from global page_table_1
+        local_token_indices = (
+            torch.arange(max_local_seqlen, device=page_table_1.device)
+            * dcp_world_size
+            + dcp_rank
+        )
+        local_token_indices = local_token_indices.clamp(
+            max=page_table_1.shape[1] - 1
+        )
+        # local_locs[b, i] = global loc for local token i of batch b
+        local_locs = page_table_1[:, local_token_indices]
+        # Convert to local buffer positions
+        local_buffer_positions = local_locs // dcp_world_size
+
+        # Convert to page-level table: sample every page_size-th entry, divide by page_size
+        page_stride_indices = torch.arange(
+            0, max_local_seqlen, page_size, device=page_table_1.device
+        )
+        # Ensure we get exactly max_local_pages entries
+        page_stride_indices = page_stride_indices[:max_local_pages]
+        local_real_page_table = (
+            local_buffer_positions[:, page_stride_indices] // page_size
+        )
+        return local_real_page_table
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
@@ -704,7 +772,9 @@ class NativeSparseAttnBackend(
             indexer_cache_seqlens_int32 = (
                 (cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
-            indexer_real_page_table = real_page_table // dcp_world_size
+            indexer_real_page_table = self._build_dcp_local_real_page_table(
+                page_table, indexer_cache_seqlens_int32, dcp_rank, dcp_world_size
+            )
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
@@ -1006,7 +1076,9 @@ class NativeSparseAttnBackend(
             indexer_cache_seqlens_int32 = (
                 (cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
-            indexer_real_page_table = real_page_table // dcp_world_size
+            indexer_real_page_table = self._build_dcp_local_real_page_table(
+                page_table_1, indexer_cache_seqlens_int32, dcp_rank, dcp_world_size
+            )
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
@@ -1232,12 +1304,14 @@ class NativeSparseAttnBackend(
                 (metadata.cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
             metadata.indexer_cache_seqlens_int32.copy_(indexer_local_seqlens)
-            if metadata.indexer_real_page_table is not None and self.real_page_size > 1:
-                real_table = self._transform_table_1_to_real(page_indices)
-                new_rows = real_table.shape[0]
-                new_cols = real_table.shape[1]
+            if metadata.indexer_real_page_table is not None:
+                local_table = self._build_dcp_local_real_page_table(
+                    page_indices, indexer_local_seqlens, dcp_rank, dcp_world_size
+                )
+                new_rows = min(local_table.shape[0], metadata.indexer_real_page_table.shape[0])
+                new_cols = min(local_table.shape[1], metadata.indexer_real_page_table.shape[1])
                 metadata.indexer_real_page_table[:new_rows, :new_cols].copy_(
-                    real_table // dcp_world_size
+                    local_table[:new_rows, :new_cols]
                 )
 
         self.forward_metadata = metadata
