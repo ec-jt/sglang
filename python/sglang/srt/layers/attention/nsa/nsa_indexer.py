@@ -457,7 +457,7 @@ class Indexer(MultiPlatformOp):
             global_max_seq = local_max_seq * dcp_world_size
 
             # All-gather logits from all DCP ranks: [dcp_world_size, B, local_max_seq]
-            gathered = dcp_group.all_gather(logits, dim=0).view(
+            gathered = dcp_group.all_gather(logits.contiguous(), dim=0).view(
                 dcp_world_size, B, local_max_seq
             )
 

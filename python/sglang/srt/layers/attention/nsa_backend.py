@@ -1655,15 +1655,18 @@ class NativeSparseAttnBackend(
         # With distributed top-K, page_table_1 contains global KV buffer indices.
         # Each rank only owns tokens where loc % dcp_world_size == dcp_rank.
         # Entries for tokens on other ranks are set to -1 (skipped by FlashMLA).
+        # NOTE: Avoid torch.tensor() creation — not allowed during CUDA graph capture.
         if get_dcp_world_size() > 1:
             dcp_world_size = get_dcp_world_size()
             dcp_rank = get_dcp_rank()
-            is_local = (page_table_1 % dcp_world_size == dcp_rank) | (page_table_1 == -1)
-            page_table_1 = torch.where(
-                is_local,
-                torch.where(page_table_1 >= 0, page_table_1 // dcp_world_size, page_table_1),
-                torch.tensor(-1, dtype=page_table_1.dtype, device=page_table_1.device),
-            )
+            # Remap all entries: divide by dcp_world_size (for local entries this gives
+            # the correct local position; for non-local entries the value doesn't matter
+            # since we'll overwrite with -1)
+            local_indices = page_table_1 // dcp_world_size
+            # Mark non-local entries as -1: entries where loc % dcp_world_size != dcp_rank
+            # (but preserve existing -1 entries)
+            is_non_local = (page_table_1 >= 0) & (page_table_1 % dcp_world_size != dcp_rank)
+            page_table_1 = torch.where(is_non_local, -1, local_indices)
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
