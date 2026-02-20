@@ -1305,8 +1305,10 @@ class NativeSparseAttnBackend(
             ).clamp_(min=0)
             metadata.indexer_cache_seqlens_int32.copy_(indexer_local_seqlens)
             if metadata.indexer_real_page_table is not None:
+                # Use the full pre-allocated page_table_1 (not the trimmed page_indices)
+                # because local_token_indices may exceed page_indices.shape[1]
                 local_table = self._build_dcp_local_real_page_table(
-                    page_indices, indexer_local_seqlens, dcp_rank, dcp_world_size
+                    metadata.page_table_1[:bs], indexer_local_seqlens, dcp_rank, dcp_world_size
                 )
                 new_rows = min(local_table.shape[0], metadata.indexer_real_page_table.shape[0])
                 new_cols = min(local_table.shape[1], metadata.indexer_real_page_table.shape[1])
