@@ -704,11 +704,10 @@ class NativeSparseAttnBackend(
             forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
-        # DCP: adjust seqlens for extend mode to reflect local KV cache shard
-        if get_dcp_world_size() > 1 and forward_batch.forward_mode.is_extend():
-            dcp_rank = get_dcp_rank()
-            dcp_world_size = get_dcp_world_size()
-            seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
+        # DCP Approach A: Do NOT adjust seqlens for extend mode. The indexer now
+        # all-gathers the index K cache and operates on global data, so it needs
+        # global seqlens. The sparse attention for extend also uses the all-gathered
+        # dcp_kv_buffer (global KV cache), so nsa_cache_seqlens should be global too.
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
             nsa_index_topk=self.nsa_index_topk,
@@ -2307,21 +2306,14 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        # When DCP is active, the precomputed paged_mqa_schedule_metadata was computed
-        # with global seqlens but the indexer needs local seqlens. Pass None so the
-        # indexer recomputes the schedule with the correct local seqlens from
-        # get_seqlens_int32(). The recomputation is a lightweight CPU-side metadata call,
-        # not a GPU kernel, so the overhead is negligible.
-        dcp_world_size = get_dcp_world_size()
-        schedule_metadata = (
-            None
-            if dcp_world_size > 1
-            else self.forward_metadata.paged_mqa_schedule_metadata
-        )
+        # DCP Approach A: The indexer now all-gathers the index K cache and
+        # operates on global data. So the schedule metadata should be computed
+        # with global seqlens. The precomputed paged_mqa_schedule_metadata was
+        # already computed with global seqlens, so we can reuse it directly.
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(),
-            paged_mqa_schedule_metadata=schedule_metadata,
+            paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

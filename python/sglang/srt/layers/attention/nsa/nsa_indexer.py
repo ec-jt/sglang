@@ -32,8 +32,14 @@ from sglang.srt.distributed import (
     get_attn_context_model_parallel_rank,
     get_attn_context_model_parallel_world_size,
 )
-from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_group,
+    get_dcp_rank,
+    get_dcp_world_size,
+    get_pp_group,
+)
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
@@ -340,6 +346,28 @@ class Indexer(MultiPlatformOp):
 
         return key
 
+    def _all_gather_index_k_cache(
+        self,
+        local_kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-gather the index K cache across DCP ranks.
+
+        Each rank stores only its own tokens' index K data (sharded by DCP).
+        This method reconstructs the full global index K cache by all-reducing
+        across DCP ranks. Since each position is written by exactly one rank
+        (others have zeros), sum-based all-reduce produces the correct result.
+
+        Args:
+            local_kv_cache: The local index K cache buffer, shape (num_pages, page_data_size)
+
+        Returns:
+            The global index K cache buffer with all ranks' data combined.
+        """
+        # Clone to avoid modifying the original buffer
+        global_kv_cache = local_kv_cache.clone()
+        get_dcp_group().all_reduce(global_kv_cache)
+        return global_kv_cache
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -351,20 +379,37 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        dcp_world_size = get_dcp_world_size()
+
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             assert page_size == 1, "only support page size 1"
-            block_tables = metadata.get_page_table_1()
+            if dcp_world_size > 1:
+                # DCP: use global page table for indexer scoring
+                block_tables = metadata.get_global_page_table_64()
+            else:
+                block_tables = metadata.get_page_table_1()
         else:
             assert page_size == 64, "only support page size 64"
-            # NOTE(dark): this support extend/decode/decode+graph
-            block_tables = metadata.get_page_table_64()
+            if dcp_world_size > 1:
+                # DCP: use global page table for indexer scoring
+                block_tables = metadata.get_global_page_table_64()
+            else:
+                # NOTE(dark): this support extend/decode/decode+graph
+                block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
+
+        # DCP Approach A: All-gather the index K cache so the indexer sees all tokens.
+        # Each rank's index K cache is sharded (stores only tokens where
+        # loc % dcp_world_size == dcp_rank). All-reduce combines them since
+        # each page position is written by exactly one rank (others are zeros).
+        if dcp_world_size > 1:
+            kv_cache_fp8 = self._all_gather_index_k_cache(kv_cache_fp8)
 
         blocksize = page_size
         if (
@@ -373,7 +418,11 @@ class Indexer(MultiPlatformOp):
         ):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
-            seqlens_32 = metadata.get_seqlens_int32()
+            if dcp_world_size > 1:
+                # DCP: use global seqlens for indexer scoring over the full cache
+                seqlens_32 = metadata.get_global_seqlens_int32()
+            else:
+                seqlens_32 = metadata.get_seqlens_int32()
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -440,10 +489,9 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        # DCP distributed top-K: the indexer computes logits over the local buffer
-        # which contains ALL ranks' data (interleaved within pages). The logits
-        # are already "global" — no all-gather needed. topk_transform selects
-        # global top-K using global seqlens and global page_table_1.
+        # With DCP Approach A, the index K cache has been all-gathered so logits
+        # are computed over the full global cache. topk_transform uses global
+        # seqlens and global page_table_1 to select the global top-K indices.
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
@@ -489,6 +537,8 @@ class Indexer(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
+        dcp_world_size = get_dcp_world_size()
+
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
             assert page_size == 1, "only support page size 1"
@@ -500,7 +550,10 @@ class Indexer(MultiPlatformOp):
         k_fp8_list = []
         k_scale_list = []
 
-        if _is_hip:
+        if dcp_world_size > 1:
+            # DCP Approach A: use global page tables for reading from all-gathered buffer
+            block_tables = metadata.get_global_page_table_64()
+        elif _is_hip:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -519,17 +572,37 @@ class Indexer(MultiPlatformOp):
         if batch_size == 0:
             return topk_result
 
-        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        # DCP Approach A: all-gather the index K buffer so we can read all tokens
+        if dcp_world_size > 1:
+            local_buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            global_buf = self._all_gather_index_k_cache(local_buf)
+            # Use global seqlens (not local indexer seqlens)
+            indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
+        else:
+            global_buf = None
+            indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+
         assert len(indexer_seq_lens_cpu) == batch_size
         for i in range(batch_size):
             seq_len = indexer_seq_lens_cpu[i].item()
             assert isinstance(seq_len, int)
-            # Use fused Triton kernel to get both K and scale in a single call
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
+            if dcp_world_size > 1:
+                # Read from the all-gathered global buffer using global page tables
+                k_fp8, k_scale = index_buf_accessor.GetKAndS.execute(
+                    forward_batch.token_to_kv_pool,
+                    global_buf,
+                    seq_len=seq_len,
+                    page_indices=block_tables[i],
+                )
+            else:
+                # Use fused Triton kernel to get both K and scale in a single call
+                k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+                    layer_id,
+                    seq_len,
+                    block_tables[i],
+                )
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
         if _is_fp8_fnuz:
