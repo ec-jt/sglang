@@ -273,9 +273,11 @@ class TritonAttnBackend(AttentionBackend):
         total_local = int(local_lens.sum().item())
 
         if total_local == 0:
-            new_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
             if kv_indices_buf is not None:
-                return kv_indices_buf, new_kv_indptr
+                # CUDA graph path: write in-place
+                kv_indptr[: bs + 1] = 0
+                return kv_indices_buf, kv_indptr
+            new_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
             return torch.empty(0, dtype=torch.int64, device=device), new_kv_indptr
 
         max_local = int(local_lens.max().item())
@@ -297,13 +299,23 @@ class TritonAttnBackend(AttentionBackend):
         else:
             filtered_kv_indices = kv_indices[filter_positions] // dcp_world_size
 
-        # Build new kv_indptr from local lengths
-        new_kv_indptr = kv_indptr.clone()
-        new_kv_indptr[0] = 0
-        new_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0).to(torch.int32)
-        new_kv_indptr = new_kv_indptr[: bs + 1]
-
-        return filtered_kv_indices, new_kv_indptr
+        # Build new kv_indptr from local lengths.
+        # For CUDA graph paths (kv_indices_buf is not None), write in-place into the
+        # passed-in kv_indptr (a view of self.kv_indptr) so the CUDA graph captures
+        # the correct memory address. For non-CUDA-graph paths, clone to avoid
+        # corrupting the shared buffer used by other forward modes (e.g., extend).
+        if kv_indices_buf is not None:
+            # CUDA graph path: write in-place
+            kv_indptr[0] = 0
+            kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0).to(torch.int32)
+            return filtered_kv_indices, kv_indptr
+        else:
+            # Non-CUDA-graph path: clone to avoid corrupting shared buffer
+            new_kv_indptr = kv_indptr.clone()
+            new_kv_indptr[0] = 0
+            new_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0).to(torch.int32)
+            new_kv_indptr = new_kv_indptr[: bs + 1]
+            return filtered_kv_indices, new_kv_indptr
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
