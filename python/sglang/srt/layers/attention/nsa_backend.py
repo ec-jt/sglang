@@ -704,14 +704,9 @@ class NativeSparseAttnBackend(
             forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
-        # DCP: adjust seqlens for extend mode to reflect local KV cache shard.
-        # The indexer all-gathers the index K cache and uses global seqlens internally,
-        # but nsa_cache_seqlens must reflect local sizes because the sparse attention
-        # reads from the local paged KV buffer (NOT dcp_kv_buffer).
-        if get_dcp_world_size() > 1 and forward_batch.forward_mode.is_extend():
-            dcp_rank = get_dcp_rank()
-            dcp_world_size = get_dcp_world_size()
-            seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
+        # DCP does NOT adjust seqlens for extend mode. During prefill, all KV is
+        # all-gathered into dcp_kv_buffer so each rank sees all tokens. The indexer
+        # also all-gathers the index K cache for global scoring. seqlens stay global.
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
             nsa_index_topk=self.nsa_index_topk,

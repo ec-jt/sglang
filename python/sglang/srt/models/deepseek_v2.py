@@ -1253,6 +1253,17 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 quant_config=quant_config,
                 prefix=add_prefix("attn_mqa", prefix),
             )
+            # DCP+NSA extend: same expanded-head attention for prefill sparse path
+            self.attn_mqa_for_dcp_extend = RadixAttention(
+                self.num_local_heads * get_dcp_world_size(),
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
@@ -2005,9 +2016,26 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            # TODO(augusto.yjh) 返回lse, correct attn_output
             if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+                # DCP decode: expanded-head attention, returns (output, lse)
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            elif forward_batch.forward_mode.is_extend() and get_dcp_world_size() > 1 and self.use_nsa:
+                # DCP+NSA extend: expanded-head attention over local KV shard,
+                # returns (output, lse) for LSE correction across DCP ranks.
+                attn_output, lse = self.attn_mqa_for_dcp_extend(
                     q_nope_out,
                     k_nope,
                     k_nope,
@@ -2080,30 +2108,22 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         # DCP LSE correction: merge partial attention outputs across DCP ranks.
-        # For decode: attn_mqa_for_dcp_decode returns (output, lse) directly.
-        # For extend with NSA: the NSA backend returns (output, lse) when DCP active
-        # because it operates on local KV shards (not dcp_kv_buffer).
-        if get_dcp_world_size() > 1:
-            if forward_batch.forward_mode.is_decode():
-                # Note(wh): make sure input tensors use nccl allocator
-                with use_symmetric_memory(get_dcp_group()):
-                    attn_output = attn_output.view(
-                        -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
-                    ).clone(memory_format=torch.contiguous_format)
-                    lse = lse.clone(memory_format=torch.contiguous_format)
-                attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
-            elif self.use_nsa and isinstance(attn_output, tuple):
-                # NSA extend with DCP: unpack (output, lse) and do LSE correction
-                attn_output, lse = attn_output
-                # Ensure LSE is [B, H] for cp_lse_ag_out_rs
-                if lse.dim() == 3:
-                    lse = lse.squeeze(-1)  # [B, H, 1] -> [B, H]
-                with use_symmetric_memory(get_dcp_group()):
-                    attn_output = attn_output.reshape(
-                        -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
-                    ).clone(memory_format=torch.contiguous_format)
-                    lse = lse.clone(memory_format=torch.contiguous_format)
-                attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
+        # Both decode and extend+NSA use expanded-head attention (num_local_heads * dcp_world_size)
+        # and return (output, lse). cp_lse_ag_out_rs all-gathers LSE, corrects outputs,
+        # and reduce-scatters back to num_local_heads.
+        if get_dcp_world_size() > 1 and (
+            forward_batch.forward_mode.is_decode()
+            or (forward_batch.forward_mode.is_extend() and self.use_nsa)
+        ):
+            # Ensure LSE is [B, H] for cp_lse_ag_out_rs
+            if lse.dim() == 3:
+                lse = lse.squeeze(-1)
+            with use_symmetric_memory(get_dcp_group()):
+                attn_output = attn_output.reshape(
+                    -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+                ).clone(memory_format=torch.contiguous_format)
+                lse = lse.clone(memory_format=torch.contiguous_format)
+            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.reshape(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
