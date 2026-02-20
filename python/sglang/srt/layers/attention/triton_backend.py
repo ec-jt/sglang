@@ -964,13 +964,26 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        # DCP extend: use all-gathered dcp_kv_buffer instead of local paged KV cache.
+        # The dcp_kv_buffer contains the full (non-sharded) prefix KV from all ranks,
+        # with new extend tokens appended. dcp_kv_indptr/dcp_kv_indices index into it.
+        if forward_batch.dcp_kv_buffer is not None:
+            dcp_kv_buf = forward_batch.dcp_kv_buffer.to(q.dtype)
+            k_buffer = dcp_kv_buf  # full KV latent (nope + rope)
+            v_buffer = dcp_kv_buf[..., : layer.v_head_dim]  # nope part only
+            kv_indptr = forward_batch.dcp_kv_indptr
+            kv_indices = forward_batch.dcp_kv_indices
+        else:
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buffer,
+            v_buffer,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
