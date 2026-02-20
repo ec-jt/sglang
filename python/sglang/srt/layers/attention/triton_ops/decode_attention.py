@@ -517,6 +517,7 @@ def _fwd_kernel_stage2(
     Mid_O,
     Mid_O_1,
     O,
+    Lse_out,
     kv_indptr,
     num_kv_splits,
     sink_ptr,
@@ -525,11 +526,13 @@ def _fwd_kernel_stage2(
     stride_mid_os,
     stride_obs,
     stride_oh,
+    stride_lse_b,
     MAX_KV_SPLITS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -581,6 +584,13 @@ def _fwd_kernel_stage2(
         mask=mask_d,
     )
 
+    if RETURN_LSE:
+        # Compute LSE = e_max + log(e_sum), then convert to log2 scale
+        # The DCP correction kernel (_correct_attn_cp_out_kernel) uses exp2/log2
+        LOG2E: tl.constexpr = 1.4426950408889634
+        lse_val = (e_max + tl.log(e_sum)) * LOG2E
+        tl.store(Lse_out + cur_batch * stride_lse_b + cur_head, lse_val)
+
 
 def _decode_softmax_reducev_fwd(
     logits,
@@ -592,6 +602,7 @@ def _decode_softmax_reducev_fwd(
     num_kv_splits,
     max_kv_splits,
     sinks=None,
+    return_lse=False,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -599,6 +610,20 @@ def _decode_softmax_reducev_fwd(
 
     MAX_KV_SPLITS = max_kv_splits
     HAS_SINK = sinks is not None
+    RETURN_LSE = return_lse
+
+    # Allocate LSE output buffer if needed
+    if return_lse:
+        import torch
+
+        lse_out = torch.empty(
+            (batch, head_num), dtype=torch.float32, device=q.device
+        )
+        lse_out_ptr = lse_out
+        stride_lse_b = head_num
+    else:
+        lse_out_ptr = o  # dummy pointer, won't be written
+        stride_lse_b = 0
 
     extra_kargs = {}
     if _is_hip:
@@ -611,6 +636,7 @@ def _decode_softmax_reducev_fwd(
         logits,
         lse,
         o,
+        lse_out_ptr,
         kv_indptr,
         num_kv_splits,
         sinks,
@@ -619,15 +645,21 @@ def _decode_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
+        stride_lse_b,
         MAX_KV_SPLITS=MAX_KV_SPLITS,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         HAS_SINK=HAS_SINK,
+        RETURN_LSE=RETURN_LSE,
         num_warps=4,
         num_stages=2,
         **extra_kargs,
     )
+
+    if return_lse:
+        return lse_out
+    return None
 
 
 def decode_attention_fwd_normal(
@@ -645,6 +677,7 @@ def decode_attention_fwd_normal(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    return_lse=False,
 ):
     _decode_att_m_fwd(
         q,
@@ -660,7 +693,7 @@ def decode_attention_fwd_normal(
         logit_cap,
         xai_temperature_len,
     )
-    _decode_softmax_reducev_fwd(
+    return _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
         q,
@@ -670,6 +703,7 @@ def decode_attention_fwd_normal(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        return_lse=return_lse,
     )
 
 
@@ -688,6 +722,7 @@ def decode_attention_fwd_grouped(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    return_lse=False,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -703,7 +738,7 @@ def decode_attention_fwd_grouped(
         logit_cap,
         xai_temperature_len,
     )
-    _decode_softmax_reducev_fwd(
+    return _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
         q,
@@ -713,6 +748,7 @@ def decode_attention_fwd_grouped(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        return_lse=return_lse,
     )
 
 
@@ -731,6 +767,7 @@ def decode_attention_fwd(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    return_lse=False,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -740,7 +777,7 @@ def decode_attention_fwd(
 
     if kv_group_num == 1:
         # MHA
-        decode_attention_fwd_normal(
+        return decode_attention_fwd_normal(
             q,
             k_buffer,
             v_buffer,
@@ -755,10 +792,11 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            return_lse=return_lse,
         )
     else:
         # GQA/MQA/MLA
-        decode_attention_fwd_grouped(
+        return decode_attention_fwd_grouped(
             q,
             k_buffer,
             v_buffer,
@@ -773,4 +811,5 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            return_lse=return_lse,
         )

@@ -1522,8 +1522,16 @@ class MLATokenToKVPool(KVCache):
 
         dcp_world_size = get_dcp_world_size()
         if dcp_world_size > 1:
-            valid_mask = loc % dcp_world_size == get_dcp_rank()
-            if not valid_mask.all():
+            # Skip DCP masking during CUDA graph capture — the data is dummy
+            # and boolean indexing produces dynamic shapes incompatible with
+            # CUDA graph recording. The original valid_mask.all() also triggers
+            # a CPU sync that breaks capture.
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                get_is_capture_mode,
+            )
+
+            if not get_is_capture_mode():
+                valid_mask = loc % dcp_world_size == get_dcp_rank()
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
 
