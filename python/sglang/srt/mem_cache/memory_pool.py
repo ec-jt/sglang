@@ -1542,16 +1542,6 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        # DCP filtering: only write tokens belonging to this rank
-        dcp_world_size = get_dcp_world_size()
-        if dcp_world_size > 1:
-            dcp_rank = get_dcp_rank()
-            valid_mask = loc % dcp_world_size == dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k_nope = cache_k_nope[valid_mask]
-                cache_k_rope = cache_k_rope[valid_mask]
-
         if self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
@@ -1899,14 +1889,15 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # DCP filtering and remapping: the index_k_with_scale_buffer is a paged
         # buffer that does NOT have DCP-aware triton kernels (unlike set_mla_kv_buffer).
         # We must filter to only local tokens and remap loc to local buffer positions.
+        # NOTE: Always apply filtering unconditionally (no .all() check) to avoid
+        # CUDA synchronization which is not allowed during CUDA graph capture.
         dcp_world_size = get_dcp_world_size()
         if dcp_world_size > 1:
             dcp_rank = get_dcp_rank()
             valid_mask = loc % dcp_world_size == dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                index_k = index_k[valid_mask]
-                index_k_scale = index_k_scale[valid_mask]
+            loc = loc[valid_mask]
+            index_k = index_k[valid_mask]
+            index_k_scale = index_k_scale[valid_mask]
             # Remap global loc to local buffer positions
             loc = loc // dcp_world_size
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
