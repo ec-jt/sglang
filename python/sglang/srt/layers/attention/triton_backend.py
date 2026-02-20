@@ -985,6 +985,18 @@ class TritonAttnBackend(AttentionBackend):
             v_buffer = dcp_kv_buf[..., : layer.v_head_dim]  # nope part only
             kv_indptr = forward_batch.dcp_kv_indptr
             kv_indices = forward_batch.dcp_kv_indices
+            if layer.layer_id == 3:  # Debug: print once for layer 3
+                import logging
+                logging.warning(
+                    f"[DCP EXTEND DEBUG] layer={layer.layer_id} "
+                    f"q.shape={q.shape} k.shape={k.shape} "
+                    f"dcp_kv_buf.shape={dcp_kv_buf.shape} "
+                    f"k_buffer.shape={k_buffer.shape} v_buffer.shape={v_buffer.shape} "
+                    f"kv_indptr={kv_indptr} kv_indices[:20]={kv_indices[:20]} "
+                    f"qo_indptr={self.forward_metadata.qo_indptr} "
+                    f"tp_q_head_num={layer.tp_q_head_num} v_head_dim={layer.v_head_dim} "
+                    f"qk_head_dim={layer.qk_head_dim}"
+                )
         else:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1198,6 +1210,19 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
             )
         else:
+            if dcp_return_lse and layer.layer_id == 3:  # Debug: print once for layer 3
+                import logging
+                k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buf = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                logging.warning(
+                    f"[DCP DECODE DEBUG] layer={layer.layer_id} "
+                    f"q.shape={q.shape} o.shape={o.shape} "
+                    f"k_buf.shape={k_buf.shape} v_buf.shape={v_buf.shape} "
+                    f"kv_indptr={kv_indptr} kv_indices[:20]={kv_indices[:20]} "
+                    f"tp_q_head_num={layer.tp_q_head_num} v_head_dim={layer.v_head_dim} "
+                    f"num_kv_splits={self.forward_metadata.num_kv_splits[:5]} "
+                    f"return_lse={dcp_return_lse}"
+                )
             lse_out = self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
