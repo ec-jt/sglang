@@ -276,24 +276,10 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        # DCP: remap page table so local position i maps to the KV buffer index
-        # for local token i (= global token i * dcp_world_size + dcp_rank).
-        # The logits from the indexer are indexed by local position, but the global
-        # page table is indexed by global position.
-        if self.is_dcp_active():
-            from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
-            dcp_rank = get_dcp_rank()
-            dcp_world_size = get_dcp_world_size()
-            B, max_global_len = page_table_size_1.shape
-            max_local_len = logits.shape[1]
-            # Build local indices: [0*dcp_world_size+dcp_rank, 1*dcp_world_size+dcp_rank, ...]
-            local_to_global = torch.arange(
-                max_local_len, device=page_table_size_1.device
-            ) * dcp_world_size + dcp_rank
-            # Clamp to valid range
-            local_to_global = local_to_global.clamp(max=max_global_len - 1)
-            # Gather: page_table_size_1[:, local_to_global]
-            page_table_size_1 = page_table_size_1[:, local_to_global]
+        # DCP distributed top-K: logits have been all-gathered and interleaved
+        # to global size in _get_topk_paged. Use global page table directly.
+        # No local remapping needed — topk_transform operates on global logits
+        # and global page_table_size_1.
 
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
@@ -528,14 +514,9 @@ class NativeSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
-            # DCP: adjust seqlens to reflect local KV cache shard.
-            # Each rank selects local top-K from its local shard, and
-            # nsa_cache_seqlens_int32 = min(local_seqlen, topk) tells the
-            # FlashMLA kernel how many valid entries are in page_table_1.
-            if get_dcp_world_size() > 1:
-                dcp_rank = get_dcp_rank()
-                dcp_world_size = get_dcp_world_size()
-                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
+            # DCP distributed top-K: use global seqlens so that
+            # nsa_cache_seqlens_int32 = min(global_seqlen, topk).
+            # The global top-K selection needs global seqlens.
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
@@ -775,15 +756,6 @@ class NativeSparseAttnBackend(
             indexer_real_page_table = self._build_dcp_local_real_page_table(
                 page_table, indexer_cache_seqlens_int32, dcp_rank, dcp_world_size
             )
-            # DCP: recompute schedule metadata with local seqlens for the indexer
-            if paged_mqa_schedule_metadata is not None:
-                try:
-                    import deep_gemm
-                    paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                        indexer_cache_seqlens_int32, 64, deep_gemm.get_num_sms()
-                    )
-                except (ImportError, ModuleNotFoundError, RuntimeError):
-                    pass
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
@@ -967,12 +939,8 @@ class NativeSparseAttnBackend(
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
 
-            # DCP: adjust seqlens to reflect local KV cache shard.
+            # DCP distributed top-K: use global seqlens.
             seqlens_expanded = cache_seqlens_int32
-            if get_dcp_world_size() > 1:
-                dcp_rank = get_dcp_rank()
-                dcp_world_size = get_dcp_world_size()
-                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
 
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
@@ -1085,33 +1053,20 @@ class NativeSparseAttnBackend(
             indexer_cache_seqlens_int32 = (
                 (cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
-            # For CUDA graph capture, allocate with max possible local size
-            # so that replay can always fit within the pre-allocated tensor.
-            page_size = self.real_page_size
-            max_local_seqlen = (self.max_context_len + dcp_world_size - 1) // dcp_world_size
-            if page_size > 1:
-                max_local_pages = (max_local_seqlen + page_size - 1) // page_size
-            else:
-                max_local_pages = max_local_seqlen
-            indexer_real_page_table = torch.zeros(
-                bs, max_local_pages, dtype=torch.int32, device=self.device
-            )
-            # Fill with actual data from warmup
-            local_table = self._build_dcp_local_real_page_table(
+            indexer_real_page_table = self._build_dcp_local_real_page_table(
                 page_table_1, indexer_cache_seqlens_int32, dcp_rank, dcp_world_size
             )
-            if local_table.shape[1] > 0:
-                cols = min(local_table.shape[1], max_local_pages)
-                indexer_real_page_table[:, :cols] = local_table[:, :cols]
-            # DCP: recompute schedule metadata with local seqlens for the indexer
-            if paged_mqa_schedule_metadata is not None:
-                try:
-                    import deep_gemm
-                    paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                        indexer_cache_seqlens_int32, 64, deep_gemm.get_num_sms()
-                    )
-                except (ImportError, ModuleNotFoundError, RuntimeError):
-                    pass
+            # For CUDA graph capture, pad to max possible local size
+            page_size = self.real_page_size
+            max_local_seqlen = (self.max_context_len + dcp_world_size - 1) // dcp_world_size
+            max_local_pages = (max_local_seqlen + page_size - 1) // page_size if page_size > 1 else max_local_seqlen
+            if indexer_real_page_table.shape[1] < max_local_pages:
+                padded = torch.zeros(
+                    indexer_real_page_table.shape[0], max_local_pages,
+                    dtype=torch.int32, device=self.device
+                )
+                padded[:, :indexer_real_page_table.shape[1]] = indexer_real_page_table
+                indexer_real_page_table = padded
         else:
             indexer_cache_seqlens_int32 = None
             indexer_real_page_table = None
@@ -1173,12 +1128,8 @@ class NativeSparseAttnBackend(
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
 
-            # DCP: adjust seqlens to reflect local KV cache shard.
+            # DCP distributed top-K: use global seqlens.
             seqlens_expanded = cache_seqlens
-            if get_dcp_world_size() > 1:
-                dcp_rank = get_dcp_rank()
-                dcp_world_size = get_dcp_world_size()
-                seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
 
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
@@ -1337,19 +1288,7 @@ class NativeSparseAttnBackend(
                 (metadata.cache_seqlens_int32 - dcp_rank - 1) // dcp_world_size + 1
             ).clamp_(min=0)
             metadata.indexer_cache_seqlens_int32.copy_(indexer_local_seqlens)
-            # DCP: recompute schedule metadata with local seqlens for the indexer
-            if metadata.paged_mqa_schedule_metadata is not None:
-                try:
-                    import deep_gemm
-                    new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                        indexer_local_seqlens, 64, deep_gemm.get_num_sms()
-                    )
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-                except (ImportError, ModuleNotFoundError, RuntimeError):
-                    pass
             if metadata.indexer_real_page_table is not None:
-                # Use the full pre-allocated page_table_1 (not the trimmed page_indices)
-                # because local_token_indices may exceed page_indices.shape[1]
                 local_table = self._build_dcp_local_real_page_table(
                     metadata.page_table_1[:bs], indexer_local_seqlens, dcp_rank, dcp_world_size
                 )
@@ -1797,11 +1736,19 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
-        # DCP: remap global KV buffer indices to local buffer positions.
-        # With local top-K + local page table remapping in topk_transform,
-        # all entries in page_table_1 belong to this rank, so simple division works.
+        # DCP distributed top-K: filter global top-K to local tokens.
+        # Global top-K may contain tokens from any rank. Keep only tokens
+        # belonging to this rank, remap to local buffer positions.
+        # Invalid (cross-rank) entries are set to -1.
         if get_dcp_world_size() > 1:
-            page_table_1 = page_table_1 // get_dcp_world_size()
+            dcp_rank = get_dcp_rank()
+            dcp_ws = get_dcp_world_size()
+            is_local = (page_table_1 % dcp_ws) == dcp_rank
+            page_table_1 = torch.where(
+                is_local,
+                page_table_1 // dcp_ws,
+                torch.tensor(-1, dtype=page_table_1.dtype, device=page_table_1.device),
+            )
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:

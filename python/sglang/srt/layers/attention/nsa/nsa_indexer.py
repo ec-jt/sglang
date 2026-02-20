@@ -440,8 +440,10 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        # With DCP, each rank computes local top-K from its local KV shard.
-        # The LSE correction across DCP ranks combines partial attention results.
+        # DCP distributed top-K: the indexer computes logits over the local buffer
+        # which contains ALL ranks' data (interleaved within pages). The logits
+        # are already "global" — no all-gather needed. topk_transform selects
+        # global top-K using global seqlens and global page_table_1.
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
