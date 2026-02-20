@@ -704,10 +704,14 @@ class NativeSparseAttnBackend(
             forward_batch, bs_idx_cpu
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
-        # DCP Approach A: Do NOT adjust seqlens for extend mode. The indexer now
-        # all-gathers the index K cache and operates on global data, so it needs
-        # global seqlens. The sparse attention for extend also uses the all-gathered
-        # dcp_kv_buffer (global KV cache), so nsa_cache_seqlens should be global too.
+        # DCP: adjust seqlens for extend mode to reflect local KV cache shard.
+        # The indexer all-gathers the index K cache and uses global seqlens internally,
+        # but nsa_cache_seqlens must reflect local sizes because the sparse attention
+        # reads from the local paged KV buffer (NOT dcp_kv_buffer).
+        if get_dcp_world_size() > 1 and forward_batch.forward_mode.is_extend():
+            dcp_rank = get_dcp_rank()
+            dcp_world_size = get_dcp_world_size()
+            seqlens_expanded = ((seqlens_expanded - dcp_rank - 1) // dcp_world_size + 1).clamp_(min=0)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
             nsa_index_topk=self.nsa_index_topk,
@@ -1545,11 +1549,12 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        # DCP: use all-gathered KV buffer for prefill if available
-        if forward_batch.forward_mode.is_extend() and getattr(forward_batch, 'dcp_kv_buffer', None) is not None:
-            kv_cache = forward_batch.dcp_kv_buffer.to(q.dtype)
-        else:
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        # DCP+NSA: Do NOT use dcp_kv_buffer for NSA sparse attention.
+        # dcp_kv_buffer is a flat, contiguous tensor designed for non-NSA MLA backends.
+        # NSA uses paged indexing (page_table_1) which requires the paged KV buffer.
+        # Each rank reads from its local paged KV shard; DCP filtering on page_table_1
+        # ensures only local entries are accessed, and LSE correction merges results.
+        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1592,6 +1597,19 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
+        # DCP: filter global top-K page_table_1 to local tokens for prefill.
+        # Same pattern as decode path — keep only entries belonging to this rank,
+        # remap global loc to local buffer position, set cross-rank entries to -1.
+        if get_dcp_world_size() > 1:
+            dcp_rank = get_dcp_rank()
+            dcp_ws = get_dcp_world_size()
+            is_local = (page_table_1 % dcp_ws) == dcp_rank
+            local_page_table = page_table_1 // dcp_ws
+            local_page_table[~is_local] = -1
+            page_table_1 = local_page_table
+
+        _return_lse = get_dcp_world_size() > 1
+
         if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1625,6 +1643,7 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=_return_lse,
             )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -1638,6 +1657,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_lse=_return_lse,
             )
         elif nsa_impl == "fa3":
             return self._forward_fa3(
