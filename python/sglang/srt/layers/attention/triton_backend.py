@@ -1269,22 +1269,49 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         if is_dcp_attention:
-            # Use pre-computed DCP metadata (computed in init_forward_metadata
-            # or init_forward_metadata_capture/replay_cuda_graph)
-            assert self.forward_metadata.dcp_kv_indptr is not None, (
-                "DCP metadata not pre-computed. Ensure init_forward_metadata was called."
-            )
+            # Use pre-computed DCP metadata if available (decode path),
+            # otherwise compute on-the-fly (extend path redirected to decode).
+            if self.forward_metadata.dcp_kv_indptr is not None:
+                dcp_kv_indptr = self.forward_metadata.dcp_kv_indptr
+                dcp_kv_indices = self.forward_metadata.dcp_kv_indices
+                dcp_num_kv_splits = self.forward_metadata.dcp_num_kv_splits
+                dcp_attn_logits = self.forward_metadata.dcp_attn_logits
+                dcp_attn_lse = self.forward_metadata.dcp_attn_lse
+            else:
+                # Extend path: compute DCP filtering on-the-fly
+                dcp_rank = get_dcp_rank()
+                bs = q.shape[0]
+                dcp_num_head = layer.tp_q_head_num
+                local_lens, dcp_kv_indices = filter_seq_indices_for_dcp(
+                    kv_indices,
+                    forward_batch.seq_lens[:bs],
+                    kv_indptr[:bs + 1],
+                    dcp_rank,
+                    dcp_world_size,
+                )
+                dcp_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+                dcp_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+                dcp_num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
+                self.get_num_kv_splits(dcp_num_kv_splits, local_lens)
+                dcp_attn_logits = torch.empty(
+                    (bs, dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                    dtype=torch.float32, device=self.device,
+                )
+                dcp_attn_lse = torch.empty(
+                    (bs, dcp_num_head, self.max_kv_splits),
+                    dtype=torch.float32, device=self.device,
+                )
 
             result = self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.forward_metadata.dcp_kv_indptr,
-                self.forward_metadata.dcp_kv_indices,
-                self.forward_metadata.dcp_attn_logits,
-                self.forward_metadata.dcp_attn_lse,
-                self.forward_metadata.dcp_num_kv_splits,
+                dcp_kv_indptr,
+                dcp_kv_indices,
+                dcp_attn_logits,
+                dcp_attn_lse,
+                dcp_num_kv_splits,
                 self.max_kv_splits,
                 layer.scaling,
                 logit_cap=logits_soft_cap,
