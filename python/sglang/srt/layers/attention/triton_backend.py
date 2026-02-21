@@ -1025,9 +1025,11 @@ class TritonAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
 
             # DCP filter the KV indices (vectorized)
+            # In extend mode, kv_indptr contains prefix KV lengths, use those
+            prefix_kv_lens = kv_indptr[1:bs+1] - kv_indptr[:bs]
             local_lens, dcp_kv_indices_flat = filter_seq_indices_for_dcp(
                 kv_indices,
-                forward_batch.seq_lens[:bs],
+                prefix_kv_lens,
                 kv_indptr[:bs + 1],
                 dcp_rank,
                 dcp_world_size,
