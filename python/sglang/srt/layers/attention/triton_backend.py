@@ -551,6 +551,30 @@ class TritonAttnBackend(AttentionBackend):
             device=self.device,
         )
 
+        # DCP: pre-allocate CUDA graph buffers for DCP-expanded attention
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            dcp_num_head = self.num_head * dcp_world_size
+            # Max DCP kv_indices size: total kv / dcp_world_size
+            max_dcp_kv_size = (max_num_tokens * self.max_context_len + dcp_world_size - 1) // dcp_world_size
+            self.cuda_graph_dcp_kv_indices = torch.zeros(
+                max_dcp_kv_size, dtype=torch.int64, device=self.device,
+            )
+            self.cuda_graph_dcp_kv_indptr = torch.zeros(
+                max_num_tokens + 1, dtype=torch.int32, device=self.device,
+            )
+            self.cuda_graph_dcp_num_kv_splits = torch.full(
+                (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device,
+            )
+            self.cuda_graph_dcp_attn_logits = torch.zeros(
+                (max_num_tokens, dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                dtype=torch.float32, device=self.device,
+            )
+            self.cuda_graph_dcp_attn_lse = torch.zeros(
+                (max_num_tokens, dcp_num_head, self.max_kv_splits),
+                dtype=torch.float32, device=self.device,
+            )
+
         if cuda_graph_num_kv_splits_buf is None:
             self.cuda_graph_num_kv_splits = torch.full(
                 (max_num_tokens,),
@@ -664,7 +688,6 @@ class TritonAttnBackend(AttentionBackend):
             dcp_world_size = get_dcp_world_size()
             if dcp_world_size > 1 and spec_info is None:
                 dcp_rank = get_dcp_rank()
-                dcp_num_head = self.num_head * dcp_world_size
                 local_lens, dcp_filtered_kv_indices = filter_seq_indices_for_dcp(
                     kv_indices,
                     seq_lens,
@@ -672,20 +695,10 @@ class TritonAttnBackend(AttentionBackend):
                     dcp_rank,
                     dcp_world_size,
                 )
-                # Store in pre-allocated cuda graph buffers
-                self.cuda_graph_dcp_kv_indices = dcp_filtered_kv_indices
-                self.cuda_graph_dcp_kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
+                # Pack into pre-allocated cuda graph buffers (same tensor addresses for graph replay)
+                self.cuda_graph_dcp_kv_indices[: dcp_filtered_kv_indices.numel()] = dcp_filtered_kv_indices
                 self.cuda_graph_dcp_kv_indptr[1 : num_tokens + 1] = torch.cumsum(local_lens, dim=0)
-                self.cuda_graph_dcp_num_kv_splits = torch.empty((num_tokens,), dtype=torch.int32, device=self.device)
                 self.get_num_kv_splits(self.cuda_graph_dcp_num_kv_splits[:num_tokens], local_lens)
-                self.cuda_graph_dcp_attn_logits = torch.zeros(
-                    (num_tokens, dcp_num_head, self.max_kv_splits, self.v_head_dim),
-                    dtype=torch.float32, device=self.device,
-                )
-                self.cuda_graph_dcp_attn_lse = torch.zeros(
-                    (num_tokens, dcp_num_head, self.max_kv_splits),
-                    dtype=torch.float32, device=self.device,
-                )
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -866,7 +879,8 @@ class TritonAttnBackend(AttentionBackend):
                     dcp_rank,
                     dcp_world_size,
                 )
-                self.cuda_graph_dcp_kv_indices = dcp_filtered_kv_indices
+                # Pack into pre-allocated buffer (same tensor address for graph replay)
+                self.cuda_graph_dcp_kv_indices[: dcp_filtered_kv_indices.numel()] = dcp_filtered_kv_indices
                 self.cuda_graph_dcp_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
                 self.get_num_kv_splits(self.cuda_graph_dcp_num_kv_splits[:num_token], local_lens)
 
