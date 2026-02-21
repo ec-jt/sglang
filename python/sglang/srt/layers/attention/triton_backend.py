@@ -1128,16 +1128,32 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        # DCP extend: use dcp_kv_buffer (all-gathered KV) when available
+        if forward_batch.dcp_kv_buffer is not None:
+            key_buffer = forward_batch.dcp_kv_buffer.to(q.dtype)
+            value_buffer = forward_batch.dcp_kv_buffer.to(q.dtype)
+        else:
+            key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # DCP extend: use dcp_kv_indptr/dcp_kv_indices when available
+        extend_kv_indptr = kv_indptr
+        extend_kv_indices = kv_indices
+        if hasattr(forward_batch, 'dcp_kv_indptr') and forward_batch.dcp_kv_indptr is not None:
+            extend_kv_indptr = forward_batch.dcp_kv_indptr
+        if hasattr(forward_batch, 'dcp_kv_indices') and forward_batch.dcp_kv_indices is not None:
+            extend_kv_indices = forward_batch.dcp_kv_indices
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            key_buffer,
+            value_buffer,
             self.forward_metadata.qo_indptr,
-            kv_indptr,
-            kv_indices,
+            extend_kv_indptr,
+            extend_kv_indices,
             self.forward_metadata.custom_mask,
             causal,
             self.forward_metadata.mask_indptr,
