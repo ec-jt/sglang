@@ -1009,21 +1009,22 @@ class TritonAttnBackend(AttentionBackend):
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
-        # DCP+NSA extend: redirect to forward_decode which supports LSE return.
-        # The DCP extend path all-gathers Q and expects (output, lse) for correction.
+        # DCP+NSA extend: use decode kernel with per-token KV mapping + LSE return.
         dcp_world_size = get_dcp_world_size()
         is_dcp_attention = (
             dcp_world_size > 1
             and layer.tp_q_head_num > self.num_head
         )
         if is_dcp_attention:
-            # DCP+NSA extend: use decode kernel with per-token KV mapping + LSE return.
-            # q/k already concatenated with q_rope/k_rope above.
+            # Read KV metadata from forward_metadata
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+
             dcp_rank = get_dcp_rank()
             bs = forward_batch.batch_size
             num_tokens = q.shape[0]
 
-            # DCP filter the KV indices (vectorized, no Python loops)
+            # DCP filter the KV indices (vectorized)
             local_lens, dcp_kv_indices_flat = filter_seq_indices_for_dcp(
                 kv_indices,
                 forward_batch.seq_lens[:bs],
