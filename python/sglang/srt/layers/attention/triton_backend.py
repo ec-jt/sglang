@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -32,6 +33,47 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def filter_seq_indices_for_dcp(
+    kv_indices: torch.Tensor,
+    paged_kernel_lens: torch.Tensor,
+    paged_kernel_lens_cumsum: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Filter KV indices for DCP (Decode Context Parallelism).
+
+    Each DCP rank only stores tokens at positions where
+    token_idx % dcp_world_size == dcp_rank. This function filters
+    kv_indices to only include those positions and divides them by
+    dcp_world_size to get local buffer positions.
+
+    Ported from flashinfer_mla_backend.py filter_seq_indices().
+
+    Returns:
+        (local_lens, filtered_kv_indices) where:
+        - local_lens: per-request local KV lengths for this DCP rank
+        - filtered_kv_indices: filtered and remapped KV indices
+    """
+    device = paged_kernel_lens.device
+    lens = paged_kernel_lens.to(torch.int64)
+    starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
+    local_lens = ((lens - dcp_rank - 1) // dcp_world_size) + 1
+    local_lens.clamp_(min=0)
+    total_local = int(local_lens.sum().item())
+    if total_local == 0:
+        return local_lens, torch.empty(0, dtype=torch.int64, device=device)
+    max_split = int(local_lens.max().item())
+    j = torch.arange(max_split, device=device, dtype=torch.int64)
+    starts_ = starts.view(-1, 1)
+    j_ = j.view(1, -1)
+    ids = starts_ + dcp_rank + j_ * dcp_world_size
+    mask = j_ < local_lens.view(-1, 1)
+    filter_kv_indices = ids[mask].to(device=device)
+    # Remap: look up original kv_indices and divide by dcp_world_size
+    filtered_kv_indices = kv_indices[filter_kv_indices] // dcp_world_size
+    return local_lens, filtered_kv_indices
 
 
 @dataclass
@@ -249,6 +291,11 @@ class TritonAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            dcp_world_size = get_dcp_world_size()
+            dcp_rank = get_dcp_rank() if dcp_world_size > 1 else 0
+            # For DCP, use local (sharded) seq_lens for num_kv_splits computation
+            decode_seq_lens_for_splits = forward_batch.seq_lens
+
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
@@ -264,11 +311,29 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+
+                # DCP: filter KV indices to only include this rank's shard
+                if dcp_world_size > 1:
+                    local_lens, kv_indices = filter_seq_indices_for_dcp(
+                        kv_indices,
+                        forward_batch.seq_lens,
+                        kv_indptr,
+                        dcp_rank,
+                        dcp_world_size,
+                    )
+                    # Recompute kv_indptr from local lengths
+                    kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    decode_seq_lens_for_splits = local_lens
+
                 # Sliding window
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
                 ):
+                    assert dcp_world_size <= 1, (
+                        "DCP + sliding window is not yet supported in triton backend"
+                    )
                     window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
                         update_sliding_window_buffer(
                             self.window_kv_indptr,
@@ -289,18 +354,23 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
+            # For DCP with expanded heads, use the expanded head count for buffers
+            num_head_for_buffers = self.num_head
+            if dcp_world_size > 1:
+                num_head_for_buffers = self.num_head * dcp_world_size
+
             attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+                (bs, num_head_for_buffers, self.max_kv_splits, self.v_head_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
             attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
+                (bs, num_head_for_buffers, self.max_kv_splits),
                 dtype=torch.float32,
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
+            self.get_num_kv_splits(num_kv_splits, decode_seq_lens_for_splits)
 
             qo_indptr = None
             custom_mask = None
@@ -449,13 +519,20 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
+        # For DCP, the model passes expanded-head Q (num_head * dcp_world_size),
+        # so we need larger buffers to accommodate the expanded head count.
+        dcp_world_size = get_dcp_world_size()
+        num_head_for_buffers = self.num_head
+        if dcp_world_size > 1:
+            num_head_for_buffers = self.num_head * dcp_world_size
+
         self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
+            (max_num_tokens, num_head_for_buffers, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
         self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits),
+            (max_num_tokens, num_head_for_buffers, self.max_kv_splits),
             dtype=torch.float32,
             device=self.device,
         )
@@ -526,6 +603,9 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_offsets = None
 
         if forward_mode.is_decode_or_idle():
+            dcp_world_size = get_dcp_world_size()
+            dcp_rank = get_dcp_rank() if dcp_world_size > 1 else 0
+
             if spec_info is None:
                 kv_indptr = self.kv_indptr
                 kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
@@ -540,10 +620,28 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+
+                # DCP: filter KV indices for this rank's shard
+                if dcp_world_size > 1:
+                    local_lens, filtered_kv_indices = filter_seq_indices_for_dcp(
+                        kv_indices,
+                        seq_lens,
+                        kv_indptr,
+                        dcp_rank,
+                        dcp_world_size,
+                    )
+                    # Pack filtered indices back into cuda graph buffer
+                    kv_indices[: filtered_kv_indices.numel()] = filtered_kv_indices
+                    kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
                 ):
+                    assert dcp_world_size <= 1, (
+                        "DCP + sliding window is not yet supported in triton backend"
+                    )
                     window_kv_indices = self.cuda_graph_window_kv_indices
                     window_num_kv_splits = self.cuda_graph_window_num_kv_splits
                     window_kv_indptr, window_kv_indices, _, _ = (
@@ -678,6 +776,9 @@ class TritonAttnBackend(AttentionBackend):
     ):
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
+            dcp_world_size = get_dcp_world_size()
+            dcp_rank = get_dcp_rank() if dcp_world_size > 1 else 0
+
             # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
@@ -694,11 +795,31 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+
+                # DCP: filter KV indices for this rank's shard
+                seq_lens_for_splits = seq_lens[:bs]
+                if dcp_world_size > 1:
+                    local_lens, filtered_kv_indices = filter_seq_indices_for_dcp(
+                        kv_indices,
+                        seq_lens[:bs],
+                        kv_indptr,
+                        dcp_rank,
+                        dcp_world_size,
+                    )
+                    # Pack filtered indices back into cuda graph buffer
+                    kv_indices[: filtered_kv_indices.numel()] = filtered_kv_indices
+                    kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    seq_lens_for_splits = local_lens
+
                 num_token = bs
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
                 ):
+                    assert dcp_world_size <= 1, (
+                        "DCP + sliding window is not yet supported in triton backend"
+                    )
                     window_num_kv_splits = self.cuda_graph_window_num_kv_splits
                     window_kv_indices = self.cuda_graph_window_kv_indices
                     _, _, window_kv_lens, _ = update_sliding_window_buffer_cuda_graph(
@@ -717,7 +838,7 @@ class TritonAttnBackend(AttentionBackend):
 
             else:
                 assert False, "Multi-step cuda graph init is not done here."
-            self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
+            self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens_for_splits)
 
         elif forward_mode.is_target_verify():
             # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
@@ -1034,9 +1155,19 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        # Determine if we need to return LSE for DCP correction
+        dcp_world_size = get_dcp_world_size()
+        need_return_lse = (
+            dcp_world_size > 1
+            and forward_batch.forward_mode.is_decode()
+        )
+
         # Check if the KV pool is FP4 and use fused FP4 kernel
         kv_pool = forward_batch.token_to_kv_pool
         if getattr(kv_pool, "is_fp4", False):
+            assert not need_return_lse, (
+                "DCP with FP4 KV cache is not yet supported in triton backend"
+            )
             # Use fused FP4 decode attention kernel (reads FP4 directly, no dequant)
             k_fp4, k_scale = kv_pool.get_key_buffer_raw(layer.layer_id)
             v_fp4, v_scale = kv_pool.get_value_buffer_raw(layer.layer_id)
@@ -1059,7 +1190,7 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
             )
         else:
-            self.decode_attention_fwd(
+            result = self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -1074,7 +1205,12 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                return_lse=need_return_lse,
             )
+            if need_return_lse:
+                # result is (o_view, final_lse) when return_lse=True
+                _, final_lse = result
+                return o, final_lse
         return o
 
 
