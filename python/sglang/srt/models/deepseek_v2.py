@@ -2033,9 +2033,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         else {}
                     ),
                 )
-            elif forward_batch.forward_mode.is_extend() and get_dcp_world_size() > 1 and self.use_nsa:
+            elif (forward_batch.forward_mode.is_extend() and get_dcp_world_size() > 1 and self.use_nsa
+                  and self.current_attention_backend != "triton"):
                 # DCP+NSA extend: expanded-head attention over local KV shard,
                 # returns (output, lse) for LSE correction across DCP ranks.
+                # Note: triton backend doesn't support causal masking + LSE return
+                # for extend, so it falls through to the regular extend path below
+                # which all-gathers KV instead of Q.
                 attn_output, lse = self.attn_mqa_for_dcp_extend(
                     q_nope_out,
                     k_nope,
