@@ -852,7 +852,17 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        # For multi-head latent attention (absorb core path)
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
+        # Handle MLA absorb core path: q_rope/k_rope passed separately
+        if q_rope is not None:
+            q = torch.cat([q.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                          q_rope.view(-1, layer.tp_q_head_num, layer.qk_head_dim - layer.v_head_dim)], dim=-1)
+            q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -861,9 +871,18 @@ class TritonAttnBackend(AttentionBackend):
 
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            if k_rope is not None:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+
+        # Concatenate k with k_rope after saving KV cache
+        if k_rope is not None:
+            k = torch.cat([k, k_rope], dim=-1)
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -1051,10 +1070,22 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        # For multi-head latent attention (absorb core path)
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
-        # During torch.compile, there is a bug in rotary_emb that causes the
-        # output value to have a 3D tensor shape. This reshapes the output correctly.
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        # Handle MLA absorb core path: q_rope/k_rope passed separately
+        if q_rope is not None:
+            # q is q_nope [bs, num_heads, kv_lora_rank], q_rope is [bs, num_heads, qk_rope_head_dim]
+            # Concatenate to get full q [bs, num_heads, kv_lora_rank + qk_rope_head_dim]
+            q = torch.cat([q.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                          q_rope.view(-1, layer.tp_q_head_num, layer.qk_head_dim - layer.v_head_dim)], dim=-1)
+            q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        else:
+            # During torch.compile, there is a bug in rotary_emb that causes the
+            # output value to have a 3D tensor shape. This reshapes the output correctly.
+            q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -1065,9 +1096,18 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            if k_rope is not None:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+
+        # Concatenate k with k_rope after saving KV cache (set_mla_kv_buffer needs them separate)
+        if k_rope is not None:
+            k = torch.cat([k, k_rope], dim=-1)
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             kv_indptr = self.forward_metadata.window_kv_indptr
