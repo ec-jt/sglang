@@ -49,28 +49,34 @@ def filter_seq_indices_for_dcp(
     kv_indices to only include those positions and divides them by
     dcp_world_size to get local buffer positions.
 
-    Ported from flashinfer_mla_backend.py filter_seq_indices().
+    CUDA-graph-safe: no GPU→CPU sync (.item() calls).
 
     Returns:
         (local_lens, filtered_kv_indices) where:
         - local_lens: per-request local KV lengths for this DCP rank
-        - filtered_kv_indices: filtered and remapped KV indices
+        - filtered_kv_indices: filtered and remapped KV indices (packed, max-size allocated)
     """
     device = paged_kernel_lens.device
     lens = paged_kernel_lens.to(torch.int64)
     starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
     local_lens = ((lens - dcp_rank - 1) // dcp_world_size) + 1
     local_lens.clamp_(min=0)
-    total_local = int(local_lens.sum().item())
-    if total_local == 0:
-        return local_lens, torch.empty(0, dtype=torch.int64, device=device)
-    max_split = int(local_lens.max().item())
+
+    # Compute max possible local length without GPU→CPU sync.
+    # Upper bound: ceil(max_possible_seq_len / dcp_world_size)
+    # We use the total kv_indices length / dcp_world_size as a safe upper bound.
+    bs = paged_kernel_lens.shape[0]
+    # max_split upper bound: total_kv / dcp_world_size (conservative)
+    max_split = (kv_indices.shape[0] + dcp_world_size - 1) // dcp_world_size
+
     j = torch.arange(max_split, device=device, dtype=torch.int64)
     starts_ = starts.view(-1, 1)
     j_ = j.view(1, -1)
     ids = starts_ + dcp_rank + j_ * dcp_world_size
     mask = j_ < local_lens.view(-1, 1)
-    filter_kv_indices = ids[mask].to(device=device)
+
+    # Use masked_select to get the filtered indices (no .item() needed)
+    filter_kv_indices = ids[mask]
     # Remap: look up original kv_indices and divide by dcp_world_size
     filtered_kv_indices = kv_indices[filter_kv_indices] // dcp_world_size
     return local_lens, filtered_kv_indices
@@ -92,6 +98,12 @@ class ForwardMetadata:
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
     window_kv_offsets: torch.Tensor
+    # DCP (Decode Context Parallelism) — separate metadata for DCP-expanded attention
+    dcp_kv_indptr: Optional[torch.Tensor] = None
+    dcp_kv_indices: Optional[torch.Tensor] = None
+    dcp_num_kv_splits: Optional[torch.Tensor] = None
+    dcp_attn_logits: Optional[torch.Tensor] = None
+    dcp_attn_lse: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -344,6 +356,38 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
+            # DCP: compute separate filtered metadata for DCP-expanded attention
+            dcp_world_size = get_dcp_world_size()
+            dcp_kv_indptr = None
+            dcp_kv_indices = None
+            dcp_num_kv_splits = None
+            dcp_attn_logits = None
+            dcp_attn_lse = None
+            if dcp_world_size > 1 and spec_info is None:
+                dcp_rank = get_dcp_rank()
+                dcp_num_head = self.num_head * dcp_world_size
+                local_lens, dcp_kv_indices = filter_seq_indices_for_dcp(
+                    kv_indices,
+                    forward_batch.seq_lens,
+                    kv_indptr,
+                    dcp_rank,
+                    dcp_world_size,
+                )
+                dcp_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+                dcp_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+                dcp_num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
+                self.get_num_kv_splits(dcp_num_kv_splits, local_lens)
+                dcp_attn_logits = torch.empty(
+                    (bs, dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                dcp_attn_lse = torch.empty(
+                    (bs, dcp_num_head, self.max_kv_splits),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
@@ -482,6 +526,11 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            dcp_kv_indptr=dcp_kv_indptr if forward_batch.forward_mode.is_decode_or_idle() else None,
+            dcp_kv_indices=dcp_kv_indices if forward_batch.forward_mode.is_decode_or_idle() else None,
+            dcp_num_kv_splits=dcp_num_kv_splits if forward_batch.forward_mode.is_decode_or_idle() else None,
+            dcp_attn_logits=dcp_attn_logits if forward_batch.forward_mode.is_decode_or_idle() else None,
+            dcp_attn_lse=dcp_attn_lse if forward_batch.forward_mode.is_decode_or_idle() else None,
         )
 
     def init_cuda_graph_state(
@@ -610,6 +659,33 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
+
+            # DCP: compute separate filtered metadata for CUDA graph capture
+            dcp_world_size = get_dcp_world_size()
+            if dcp_world_size > 1 and spec_info is None:
+                dcp_rank = get_dcp_rank()
+                dcp_num_head = self.num_head * dcp_world_size
+                local_lens, dcp_filtered_kv_indices = filter_seq_indices_for_dcp(
+                    kv_indices,
+                    seq_lens,
+                    kv_indptr,
+                    dcp_rank,
+                    dcp_world_size,
+                )
+                # Store in pre-allocated cuda graph buffers
+                self.cuda_graph_dcp_kv_indices = dcp_filtered_kv_indices
+                self.cuda_graph_dcp_kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
+                self.cuda_graph_dcp_kv_indptr[1 : num_tokens + 1] = torch.cumsum(local_lens, dim=0)
+                self.cuda_graph_dcp_num_kv_splits = torch.empty((num_tokens,), dtype=torch.int32, device=self.device)
+                self.get_num_kv_splits(self.cuda_graph_dcp_num_kv_splits[:num_tokens], local_lens)
+                self.cuda_graph_dcp_attn_logits = torch.zeros(
+                    (num_tokens, dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                    dtype=torch.float32, device=self.device,
+                )
+                self.cuda_graph_dcp_attn_lse = torch.zeros(
+                    (num_tokens, dcp_num_head, self.max_kv_splits),
+                    dtype=torch.float32, device=self.device,
+                )
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -691,6 +767,19 @@ class TritonAttnBackend(AttentionBackend):
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
             )
 
+        # Set DCP metadata for CUDA graph capture (only for decode)
+        dcp_kv_indptr = None
+        dcp_kv_indices = None
+        dcp_num_kv_splits = None
+        dcp_attn_logits = None
+        dcp_attn_lse = None
+        if forward_mode.is_decode_or_idle() and hasattr(self, 'cuda_graph_dcp_kv_indptr'):
+            dcp_kv_indptr = self.cuda_graph_dcp_kv_indptr
+            dcp_kv_indices = self.cuda_graph_dcp_kv_indices
+            dcp_num_kv_splits = self.cuda_graph_dcp_num_kv_splits
+            dcp_attn_logits = self.cuda_graph_dcp_attn_logits
+            dcp_attn_lse = self.cuda_graph_dcp_attn_lse
+
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -705,6 +794,11 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            dcp_kv_indptr=dcp_kv_indptr,
+            dcp_kv_indices=dcp_kv_indices,
+            dcp_num_kv_splits=dcp_num_kv_splits,
+            dcp_attn_logits=dcp_attn_logits,
+            dcp_attn_lse=dcp_attn_lse,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -760,6 +854,21 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 assert False, "Multi-step cuda graph init is not done here."
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
+
+            # DCP: update filtered metadata for CUDA graph replay
+            dcp_world_size = get_dcp_world_size()
+            if dcp_world_size > 1 and spec_info is None and hasattr(self, 'cuda_graph_dcp_kv_indices'):
+                dcp_rank = get_dcp_rank()
+                local_lens, dcp_filtered_kv_indices = filter_seq_indices_for_dcp(
+                    kv_indices,
+                    seq_lens[:bs],
+                    kv_indptr,
+                    dcp_rank,
+                    dcp_world_size,
+                )
+                self.cuda_graph_dcp_kv_indices = dcp_filtered_kv_indices
+                self.cuda_graph_dcp_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+                self.get_num_kv_splits(self.cuda_graph_dcp_num_kv_splits[:num_token], local_lens)
 
         elif forward_mode.is_target_verify():
             # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
@@ -1127,49 +1236,22 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         if is_dcp_attention:
-            # Lazy DCP filtering: filter kv_indices and kv_indptr for this rank's shard
-            dcp_rank = get_dcp_rank()
-            bs = q.shape[0]
-            local_lens, dcp_kv_indices = filter_seq_indices_for_dcp(
-                kv_indices,
-                forward_batch.seq_lens[:bs],
-                kv_indptr[:bs + 1],
-                dcp_rank,
-                dcp_world_size,
+            # Use pre-computed DCP metadata (computed in init_forward_metadata
+            # or init_forward_metadata_capture/replay_cuda_graph)
+            assert self.forward_metadata.dcp_kv_indptr is not None, (
+                "DCP metadata not pre-computed. Ensure init_forward_metadata was called."
             )
-            # Build local kv_indptr from local_lens
-            dcp_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
-            dcp_kv_indptr[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
-
-            # Allocate DCP-sized intermediate buffers for expanded heads
-            dcp_num_head = layer.tp_q_head_num
-            dcp_attn_logits = torch.empty(
-                (bs, dcp_num_head, self.max_kv_splits, self.v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            dcp_attn_lse = torch.empty(
-                (bs, dcp_num_head, self.max_kv_splits),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            dcp_num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(dcp_num_kv_splits, local_lens)
-
-            # Use DCP-filtered metadata for the kernel call
-            kv_indptr = dcp_kv_indptr
-            kv_indices = dcp_kv_indices
 
             result = self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                kv_indptr,
-                kv_indices,
-                dcp_attn_logits,
-                dcp_attn_lse,
-                dcp_num_kv_splits,
+                self.forward_metadata.dcp_kv_indptr,
+                self.forward_metadata.dcp_kv_indices,
+                self.forward_metadata.dcp_attn_logits,
+                self.forward_metadata.dcp_attn_lse,
+                self.forward_metadata.dcp_num_kv_splits,
                 self.max_kv_splits,
                 layer.scaling,
                 logit_cap=logits_soft_cap,
