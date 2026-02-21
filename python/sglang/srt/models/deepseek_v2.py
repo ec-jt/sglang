@@ -2129,7 +2129,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
                 ).clone(memory_format=torch.contiguous_format)
                 lse = lse.clone(memory_format=torch.contiguous_format)
-            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
+            attn_output = cp_lse_ag_out_rs(
+                attn_output, lse, get_dcp_group(),
+                is_lse_base_on_e=(self.current_attention_backend == "triton"),
+            )
         attn_output = attn_output.reshape(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:

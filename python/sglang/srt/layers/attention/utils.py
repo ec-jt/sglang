@@ -457,6 +457,7 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    USE_LOG2: tl.constexpr = True,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -472,6 +473,8 @@ def _correct_attn_cp_out_kernel(
             Pointer to output tensor of shape [ B, H, D ]
         vlse_ptr (triton.PointerType):
             Pointer to output tensor of shape [ B, H ]
+        USE_LOG2: If True, use exp2/log2 (base-2, for flashinfer).
+                  If False, use exp/log (natural, for triton kernel).
     """
     batch_idx = tl.program_id(axis=0).to(tl.int64)
     head_idx = tl.program_id(axis=1).to(tl.int64)
@@ -491,9 +494,15 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
     lse -= lse_max
-    lse_exp = tl.exp2(lse)
+    if USE_LOG2:
+        lse_exp = tl.exp2(lse)
+    else:
+        lse_exp = tl.exp(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    lse = tl.log2(lse_acc)
+    if USE_LOG2:
+        lse = tl.log2(lse_acc)
+    else:
+        lse = tl.log(lse_acc)
     lse += lse_max
 
     lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
@@ -517,7 +526,10 @@ def _correct_attn_cp_out_kernel(
         -float("inf"),
         lse_finally,
     )
-    factor = tl.exp2(lse_finally)
+    if USE_LOG2:
+        factor = tl.exp2(lse_finally)
+    else:
+        factor = tl.exp(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
 
@@ -538,7 +550,8 @@ class CPTritonContext:
 
 
 def correct_attn_out(
-    out: torch.Tensor, lses: torch.Tensor, cp_rank: int, ctx: CPTritonContext
+    out: torch.Tensor, lses: torch.Tensor, cp_rank: int, ctx: CPTritonContext,
+    use_log2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -547,6 +560,7 @@ def correct_attn_out(
         lses: Tensor of shape [ N, B, H ]
         cp_rank: Current rank in the context-parallel group
         ctx: Triton context to avoid recompilation
+        use_log2: If True, LSE is in base-2 (flashinfer). If False, natural log (triton).
 
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
@@ -599,7 +613,7 @@ def correct_attn_out(
         l_sH,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
+    const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "USE_LOG2": use_log2}
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
@@ -610,10 +624,13 @@ def cp_lse_ag_out_rs(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     ctx: CPTritonContext = None,
+    is_lse_base_on_e: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
+    is_lse_base_on_e: If True, LSE is in natural log (triton kernel).
+                      If False, LSE is in base-2 (flashinfer, default).
     """
     if cp_group.world_size == 1:
         return cp_attn_out
@@ -624,6 +641,7 @@ def cp_lse_ag_out_rs(
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
+    use_log2 = not is_lse_base_on_e
+    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx, use_log2=use_log2)
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out

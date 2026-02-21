@@ -587,10 +587,9 @@ def _fwd_kernel_stage2(
     )
 
     if RETURN_LSE:
-        # Convert from natural log to log base 2 for compatibility with
-        # _correct_attn_cp_out_kernel which uses exp2/log2.
-        # lse_base2 = (e_max + ln(e_sum)) * log2(e) = (e_max + ln(e_sum)) / ln(2)
-        final_lse_val = (e_max + tl.log(e_sum)) * 1.4426950408889634
+        # Return LSE in natural log (no base conversion).
+        # The caller must use a natural-log-compatible correction kernel.
+        final_lse_val = e_max + tl.log(e_sum)
         tl.store(Final_Lse + cur_batch * stride_lse_b + cur_head * stride_lse_h, final_lse_val)
 
 
