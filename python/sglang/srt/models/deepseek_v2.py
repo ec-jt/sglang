@@ -1946,7 +1946,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 d_nope = q_nope_out.size(-1)
                 q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
             elif forward_batch.forward_mode.is_extend():
-                if self.use_nsa:
+                if self.use_nsa and self.current_attention_backend != "triton":
                     # DCP+NSA extend: all-gather Q heads (like decode) instead of KV.
                     # NSA sparse attention uses paged KV buffer (incompatible with
                     # flat dcp_kv_buffer). Each rank computes sparse attention over
@@ -2118,7 +2118,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         # and reduce-scatters back to num_local_heads.
         if get_dcp_world_size() > 1 and (
             forward_batch.forward_mode.is_decode()
-            or (forward_batch.forward_mode.is_extend() and self.use_nsa)
+            or (forward_batch.forward_mode.is_extend() and self.use_nsa
+                and self.current_attention_backend != "triton")
         ):
             # Ensure LSE is [B, H] for cp_lse_ag_out_rs
             if lse.dim() == 3:
