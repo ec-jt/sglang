@@ -1017,16 +1017,81 @@ class TritonAttnBackend(AttentionBackend):
             and layer.tp_q_head_num > self.num_head
         )
         if is_dcp_attention:
-            # Use the decode path which supports DCP filtering + LSE return.
-            # Note: q and k have already been concatenated with q_rope/k_rope above,
-            # so pass q_rope=None, k_rope=None to avoid double concatenation.
-            return self.forward_decode(
-                q, k, v, layer, forward_batch,
-                save_kv_cache=False,  # Already saved above
-                sinks=sinks,
-                q_rope=None,
-                k_rope=None,
+            # DCP+NSA extend: use decode kernel with per-token KV mapping + LSE return.
+            # q/k already concatenated with q_rope/k_rope above.
+            dcp_rank = get_dcp_rank()
+            bs = forward_batch.batch_size
+            num_tokens = q.shape[0]
+
+            # DCP filter the KV indices (vectorized, no Python loops)
+            local_lens, dcp_kv_indices_flat = filter_seq_indices_for_dcp(
+                kv_indices,
+                forward_batch.seq_lens[:bs],
+                kv_indptr[:bs + 1],
+                dcp_rank,
+                dcp_world_size,
             )
+            dcp_kv_indptr_local = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+            dcp_kv_indptr_local[1 : bs + 1] = torch.cumsum(local_lens, dim=0)
+
+            # Build per-token kv_indptr using qo_indptr to map tokens to requests (vectorized)
+            qo_indptr = self.forward_metadata.qo_indptr[:bs + 1]
+            # tokens_per_req[i] = number of Q tokens for request i
+            tokens_per_req = qo_indptr[1:bs+1] - qo_indptr[:bs]
+            # kv_per_token[token_j] = local KV length of the request that token_j belongs to
+            # Use repeat_interleave to expand local_lens by tokens_per_req
+            kv_per_token = local_lens.to(torch.int32).repeat_interleave(tokens_per_req)
+            per_token_kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
+            per_token_kv_indptr[1:] = torch.cumsum(kv_per_token, dim=0)
+
+            # Build per-token kv_indices: for each token, copy its request's KV indices
+            # Use repeat_interleave on the request index to get per-token request mapping
+            req_idx_per_token = torch.arange(bs, device=self.device).repeat_interleave(tokens_per_req)
+            total_kv = int(per_token_kv_indptr[num_tokens].item())
+            per_token_kv_indices = torch.empty(total_kv, dtype=torch.int64, device=self.device)
+            # For each token, copy its request's DCP KV indices
+            # Use a triton kernel or vectorized approach
+            for i in range(num_tokens):
+                req = req_idx_per_token[i].item()
+                src_start = dcp_kv_indptr_local[req].item()
+                src_end = dcp_kv_indptr_local[req + 1].item()
+                dst_start = per_token_kv_indptr[i].item()
+                dst_end = per_token_kv_indptr[i + 1].item()
+                per_token_kv_indices[dst_start:dst_end] = dcp_kv_indices_flat[src_start:src_end]
+
+            # Allocate DCP buffers
+            dcp_num_head = layer.tp_q_head_num
+            dcp_attn_logits = torch.empty(
+                (num_tokens, dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                dtype=torch.float32, device=self.device,
+            )
+            dcp_attn_lse = torch.empty(
+                (num_tokens, dcp_num_head, self.max_kv_splits),
+                dtype=torch.float32, device=self.device,
+            )
+            dcp_num_kv_splits = torch.empty((num_tokens,), dtype=torch.int32, device=self.device)
+            self.get_num_kv_splits(dcp_num_kv_splits, kv_per_token)
+
+            # Run decode kernel on all tokens at once
+            result = self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                per_token_kv_indptr,
+                per_token_kv_indices,
+                dcp_attn_logits,
+                dcp_attn_lse,
+                dcp_num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                return_lse=True,
+            )
+            _, final_lse = result
+            return o, final_lse
 
         causal = True
         if (
