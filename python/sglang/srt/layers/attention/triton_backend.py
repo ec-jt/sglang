@@ -1062,18 +1062,19 @@ class TritonAttnBackend(AttentionBackend):
                 dst_end = per_token_kv_indptr[i + 1].item()
                 per_token_kv_indices[dst_start:dst_end] = dcp_kv_indices_flat[src_start:src_end]
 
-            # Allocate DCP buffers
+            # Allocate DCP buffers — use max_kv_splits=1 for extend to save memory
+            # (extend prefix KV is small, doesn't need split-KV)
+            extend_max_kv_splits = 1
             dcp_num_head = layer.tp_q_head_num
             dcp_attn_logits = torch.empty(
-                (num_tokens, dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                (num_tokens, dcp_num_head, extend_max_kv_splits, self.v_head_dim),
                 dtype=torch.float32, device=self.device,
             )
             dcp_attn_lse = torch.empty(
-                (num_tokens, dcp_num_head, self.max_kv_splits),
+                (num_tokens, dcp_num_head, extend_max_kv_splits),
                 dtype=torch.float32, device=self.device,
             )
-            dcp_num_kv_splits = torch.empty((num_tokens,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(dcp_num_kv_splits, kv_per_token)
+            dcp_num_kv_splits = torch.ones((num_tokens,), dtype=torch.int32, device=self.device)
 
             # Run decode kernel on all tokens at once
             result = self.decode_attention_fwd(
@@ -1086,7 +1087,7 @@ class TritonAttnBackend(AttentionBackend):
                 dcp_attn_logits,
                 dcp_attn_lse,
                 dcp_num_kv_splits,
-                self.max_kv_splits,
+                extend_max_kv_splits,
                 layer.scaling,
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
