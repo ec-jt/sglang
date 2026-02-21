@@ -1017,13 +1017,15 @@ class TritonAttnBackend(AttentionBackend):
             and layer.tp_q_head_num > self.num_head
         )
         if is_dcp_attention:
-            # Use the decode path which supports DCP filtering + LSE return
+            # Use the decode path which supports DCP filtering + LSE return.
+            # Note: q and k have already been concatenated with q_rope/k_rope above,
+            # so pass q_rope=None, k_rope=None to avoid double concatenation.
             return self.forward_decode(
                 q, k, v, layer, forward_batch,
                 save_kv_cache=False,  # Already saved above
                 sinks=sinks,
-                q_rope=q_rope,
-                k_rope=k_rope,
+                q_rope=None,
+                k_rope=None,
             )
 
         causal = True
