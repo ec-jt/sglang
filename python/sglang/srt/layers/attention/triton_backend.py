@@ -1009,6 +1009,23 @@ class TritonAttnBackend(AttentionBackend):
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
+        # DCP+NSA extend: redirect to forward_decode which supports LSE return.
+        # The DCP extend path all-gathers Q and expects (output, lse) for correction.
+        dcp_world_size = get_dcp_world_size()
+        is_dcp_attention = (
+            dcp_world_size > 1
+            and layer.tp_q_head_num > self.num_head
+        )
+        if is_dcp_attention:
+            # Use the decode path which supports DCP filtering + LSE return
+            return self.forward_decode(
+                q, k, v, layer, forward_batch,
+                save_kv_cache=False,  # Already saved above
+                sinks=sinks,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
+
         causal = True
         if (
             layer.is_cross_attention
