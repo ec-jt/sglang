@@ -2001,6 +2001,19 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None
 
+        # When PP > 1 and mixed chunk is not available, yield to decode
+        # periodically to prevent decode starvation from continuous chunked
+        # prefill.  The running_batch holds requests waiting for decode steps;
+        # if we never return None here, those requests are starved.
+        if (
+            self.pp_size > 1
+            and not self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and self.chunked_req is not None
+            and self.forward_ct % (self.pp_size + 1) == 0
+        ):
+            return None
+
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
