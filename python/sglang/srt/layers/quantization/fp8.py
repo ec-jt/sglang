@@ -71,6 +71,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_hip,
@@ -679,7 +680,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
-            assert is_sm100_supported() or is_sm90_supported()
+            assert is_blackwell_supported() or is_sm90_supported()
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
