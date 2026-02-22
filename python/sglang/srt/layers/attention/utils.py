@@ -112,6 +112,15 @@ def create_flashmla_kv_indices_triton(
         )
 
 
+def _next_power_of_2(n):
+    """Return the smallest power of 2 >= n."""
+    n = max(n, 1)
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
 @triton.jit
 def concat_and_cast_mha_k_kernel(
     k_ptr,
@@ -125,13 +134,16 @@ def concat_and_cast_mha_k_kernel(
     rope_stride0: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    NOPE_DIM_PADDED: tl.constexpr,
+    ROPE_DIM_PADDED: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
     head_range = tl.arange(0, head_cnt)
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    nope_offs = tl.arange(0, NOPE_DIM_PADDED)
+    nope_mask = nope_offs[None, :] < nope_dim
 
     src_nope_ptr = (
         k_nope_ptr
@@ -141,14 +153,15 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
+    src_nope = tl.load(src_nope_ptr, mask=nope_mask, other=0.0)
+    tl.store(dst_nope_ptr, src_nope, mask=nope_mask)
 
-    rope_offs = tl.arange(0, rope_dim)
+    rope_offs = tl.arange(0, ROPE_DIM_PADDED)
+    rope_mask = rope_offs[None, :] < rope_dim
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope)
+    src_rope = tl.load(src_rope_ptr, mask=rope_mask, other=0.0)
+    tl.store(dst_rope_ptr, src_rope, mask=rope_mask)
 
 
 def concat_and_cast_mha_k_triton(
@@ -186,6 +199,8 @@ def concat_and_cast_mha_k_triton(
         k_rope.stride(0),
         nope_dim,
         rope_dim,
+        _next_power_of_2(nope_dim),
+        _next_power_of_2(rope_dim),
     )
 
 
