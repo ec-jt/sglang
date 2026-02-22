@@ -712,6 +712,7 @@ void fp8_blockwise_scaled_grouped_mm(
 #if CUDA_VERSION >= 12090
       || sm_version == 103
 #endif
+      || sm_version == 120
   ) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm100_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
