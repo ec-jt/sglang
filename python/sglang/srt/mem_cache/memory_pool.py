@@ -1546,6 +1546,16 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
+        # DCP filtering: each rank only stores tokens at positions where
+        # loc % dcp_world_size == dcp_rank
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            valid_mask = loc % dcp_world_size == get_dcp_rank()
+            if not valid_mask.all():
+                loc = loc[valid_mask]
+                cache_k_nope = cache_k_nope[valid_mask]
+                cache_k_rope = cache_k_rope[valid_mask]
+
         if self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
@@ -1696,6 +1706,16 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
+
+        # DCP filtering: each rank only stores tokens at positions where
+        # loc % dcp_world_size == dcp_rank
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            valid_mask = loc % dcp_world_size == get_dcp_rank()
+            if not valid_mask.all():
+                loc = loc[valid_mask]
+                cache_k = cache_k[valid_mask]
+
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1719,6 +1739,16 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
+
+        # DCP filtering: each rank only stores tokens at positions where
+        # loc % dcp_world_size == dcp_rank
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            valid_mask = loc % dcp_world_size == get_dcp_rank()
+            if not valid_mask.all():
+                loc = loc[valid_mask]
+                cache_k_nope = cache_k_nope[valid_mask]
+                cache_k_rope = cache_k_rope[valid_mask]
 
         if self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
