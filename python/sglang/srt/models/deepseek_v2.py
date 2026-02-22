@@ -191,7 +191,7 @@ if _use_aiter_gfx95:
     )
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm, merge_state_v2
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
