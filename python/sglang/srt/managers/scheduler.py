@@ -834,6 +834,13 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
+        
+        # Init PP decode interleave counter to prevent decode starvation
+        self._consecutive_prefill_count = 0
+        pp_max_consecutive = envs.SGLANG_PP_MAX_CONSECUTIVE_PREFILLS.get()
+        self._pp_max_consecutive_prefills = (
+            self.pp_size if pp_max_consecutive < 0 else pp_max_consecutive
+        )
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
@@ -1946,11 +1953,24 @@ class Scheduler(
             )
             need_mlp_sync = new_batch is None
 
+        # Force decode interleave for PP to prevent decode starvation
+        if (
+            self.pp_size > 1
+            and not self.is_mixed_chunk
+            and new_batch is not None
+            and not self.running_batch.is_empty()
+            and self._consecutive_prefill_count >= self._pp_max_consecutive_prefills
+        ):
+            self._consecutive_prefill_count = 0
+            new_batch = None  # Force decode this iteration
+
         if new_batch is not None:
             # Run prefill first if possible
+            self._consecutive_prefill_count += 1
             ret = new_batch
         else:
             # Run decode
+            self._consecutive_prefill_count = 0
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
