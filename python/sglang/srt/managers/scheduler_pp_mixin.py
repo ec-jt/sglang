@@ -27,6 +27,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.utils import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
@@ -97,8 +98,12 @@ class SchedulerPPMixin:
                     # skip this batch to avoid KeyError crash in model forward
                     if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
                         logger.warning(
-                            f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected)"
+                            f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
+                            f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
                         )
+                        # Free KV cache for all requests in the skipped batch to prevent memory leak
+                        for req in self.cur_batch.reqs:
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
                         self.cur_batch = None
                         self.mbs[mb_id] = None
                 next_pp_outputs = None
