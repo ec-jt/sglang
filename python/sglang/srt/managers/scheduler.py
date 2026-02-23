@@ -2222,9 +2222,20 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
+                decode_bs = len(self.running_batch.reqs)
+                prefill_bs = len(new_batch.reqs)
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
+                if self.pp_size > 1:
+                    logger.info(
+                        "[PP%d] MIXED batch: %d prefill + %d decode reqs, "
+                        "forward_ct=%d",
+                        self.pp_rank if hasattr(self, 'pp_rank') else 0,
+                        prefill_bs,
+                        decode_bs,
+                        self.forward_ct,
+                    )
             self.running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=self.running_batch.batch_is_full
             )
