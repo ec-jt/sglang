@@ -1950,11 +1950,17 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 )
 
                 # copy local kv cache into forward_batch.dcp_kv_buffer
+                # Fix: Use explicit extend_len to avoid shape mismatch when buffer remainder != k_nope size
+                extend_len = k_nope.shape[0]
                 forward_batch.dcp_kv_buffer[
-                    forward_batch.dcp_extend_prefix_lens_sum :, ..., : self.kv_lora_rank
+                    forward_batch.dcp_extend_prefix_lens_sum : forward_batch.dcp_extend_prefix_lens_sum + extend_len,
+                    ...,
+                    : self.kv_lora_rank,
                 ] = k_nope
                 forward_batch.dcp_kv_buffer[
-                    forward_batch.dcp_extend_prefix_lens_sum :, ..., self.kv_lora_rank :
+                    forward_batch.dcp_extend_prefix_lens_sum : forward_batch.dcp_extend_prefix_lens_sum + extend_len,
+                    ...,
+                    self.kv_lora_rank :,
                 ] = k_pe
             else:
                 logger.warn(f"not supported forward_mode {forward_batch.forward_mode}")
