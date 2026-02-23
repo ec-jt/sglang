@@ -1865,12 +1865,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
-                # Always keep at least one request
+                # Check if the last request itself is consuming too much memory
+                # If so, abort it instead of crashing
+                if not self.check_decode_mem(selected_indices=sorted_indices):
+                    # The single remaining request cannot allocate even one more token
+                    # This can happen with DCP when a request consumes the entire virtual pool
+                    idx = sorted_indices.pop()
+                    req = self.reqs[idx]
+                    reqs_to_abort.append(req)
+                    logger.warning(
+                        f"Aborting request {req.rid} due to OOM. "
+                        f"Request has consumed all available KV cache memory. "
+                        f"Consider reducing context_length or max_running_requests with DCP enabled."
+                    )
+                    self.release_req(idx, len(sorted_indices), server_args)
                 break
 
             first_iter = False
@@ -1880,12 +1894,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if len(sorted_indices) == 0 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
-            # Retracting loops ends and still not enough memory
+            # All requests were aborted/retracted and still OOM - this should not happen
             raise ValueError(
-                "Out of memory even after retracting all other requests in the decode batch."
+                "Out of memory even after retracting and aborting all requests in the decode batch."
             )
 
         self.filter_batch(keep_indices=sorted_indices)
@@ -1902,7 +1916,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
