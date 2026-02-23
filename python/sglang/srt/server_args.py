@@ -2253,19 +2253,12 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
-            # Auto-enable mixed chunked prefill for PP to prevent decode
-            # starvation.  Without mixed chunk, the scheduler always
-            # prioritises prefill batches and decode requests can be starved
-            # for long periods (TRT-LLM-style "inflight batching").
-            if (
-                not self.enable_mixed_chunk
-                and self.chunked_prefill_size > 0
-            ):
-                self.enable_mixed_chunk = True
+            if self.enable_mixed_chunk:
                 logger.info(
-                    "Auto-enabling mixed chunked prefill for pipeline parallelism "
-                    "to prevent decode starvation. Use --enable-mixed-chunk=False "
-                    "to disable."
+                    "Mixed chunked prefill enabled with pipeline parallelism "
+                    "(pp_size=%d). This enables TRT-LLM-style inflight batching "
+                    "where decode tokens are interleaved with prefill chunks.",
+                    self.pp_size,
                 )
 
     def _handle_hicache(self):
