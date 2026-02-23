@@ -775,6 +775,13 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        if self.is_mixed_chunk and self.pp_size > 1:
+            logger.info(
+                "[PP Mixed Chunk] Mixed chunked prefill enabled with pipeline "
+                "parallelism (pp_size=%d). Decode tokens will be interleaved "
+                "with prefill chunks to prevent decode starvation.",
+                self.pp_size,
+            )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -2334,11 +2341,12 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
-        # Capture prefill start time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
+        # Capture prefill start time for EXTEND and MIXED mode
+        if batch.forward_mode == ForwardMode.EXTEND or batch.forward_mode == ForwardMode.MIXED:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_start_time_host = current_time
+                if req.time_stats.prefill_start_time_host == 0:
+                    req.time_stats.prefill_start_time_host = current_time
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
