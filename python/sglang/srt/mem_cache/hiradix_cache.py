@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
+from sglang.srt.distributed import get_dcp_world_size
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -66,12 +67,21 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        # With DCP, params.page_size is expanded by dcp_world_size for virtual indices.
+        # The host memory pool should use the physical page size (1 token per DCP rank per page).
+        dcp_world_size = get_dcp_world_size()
+        if dcp_world_size > 1:
+            # Physical page size = virtual page size / dcp_world_size
+            host_page_size = self.page_size // dcp_world_size
+        else:
+            host_page_size = self.page_size
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                host_page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
@@ -80,7 +90,7 @@ class HiRadixCache(RadixCache):
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                host_page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
@@ -89,7 +99,7 @@ class HiRadixCache(RadixCache):
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                host_page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
