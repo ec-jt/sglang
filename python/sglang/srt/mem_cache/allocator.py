@@ -95,6 +95,38 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
+    def translate_virtual_to_physical(self, indices):
+        """Translate virtual indices to physical indices for HiCache operations.
+
+        For non-DCP allocators, this is an identity operation.
+        For DCP allocators, this filters and translates indices.
+
+        Args:
+            indices: Virtual indices tensor
+
+        Returns:
+            Physical indices tensor
+        """
+        return indices
+
+    def translate_physical_to_virtual(self, indices):
+        """Translate physical indices back to virtual indices.
+
+        For non-DCP allocators, this is an identity operation.
+        For DCP allocators, this converts physical indices back to virtual.
+
+        Args:
+            indices: Physical indices tensor
+
+        Returns:
+            Virtual indices tensor
+        """
+        return indices
+
+    def is_dcp_enabled(self):
+        """Check if DCP is enabled."""
+        return False
+
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")
 
@@ -582,10 +614,38 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.real_allocator.clear()
 
     def alloc(self, need_size: int):
-        raise NotImplementedError()
+        """Allocate physical indices for HiCache restore operations.
+
+        With DCP, this allocates physical indices (not virtual) because HiCache
+        stores physical KV data. The caller is responsible for tracking the
+        mapping between virtual and physical indices.
+
+        Args:
+            need_size: Number of physical indices to allocate
+
+        Returns:
+            Physical indices tensor, or None if allocation fails
+        """
+        return self.real_allocator.alloc(need_size)
 
     def free(self, free_index: torch.Tensor):
         return self.real_allocator.free(free_index)
+
+    def translate_physical_to_virtual(self, physical_indices):
+        """Translate physical indices back to virtual indices.
+
+        This is the inverse of translate_virtual_to_physical. Used when restoring
+        KV cache from CPU to GPU - the physical indices need to be converted back
+        to virtual indices for storage in the radix tree.
+
+        Args:
+            physical_indices: Physical indices tensor
+
+        Returns:
+            Virtual indices tensor
+        """
+        # physical_index * dcp_world_size + dcp_rank = virtual_index
+        return physical_indices * self.dcp_world_size + self.dcp_rank
 
     def filter_local_indices(self, indices):
         # TODO write a triton kernel to make this faster
@@ -594,3 +654,23 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             // self.dcp_world_size
         )
         return indices
+
+    def translate_virtual_to_physical(self, indices):
+        """Translate virtual indices to physical indices for HiCache operations.
+
+        With DCP, the radix tree stores virtual indices (0 to real_kv_size * dcp_world_size).
+        When HiCache needs to access the actual GPU KV buffer, it needs physical indices
+        (0 to real_kv_size per rank). This method filters indices belonging to this rank
+        and translates them to physical indices.
+
+        Args:
+            indices: Virtual indices tensor
+
+        Returns:
+            Physical indices tensor for this rank's portion of the KV cache
+        """
+        return self.filter_local_indices(indices)
+
+    def is_dcp_enabled(self):
+        """Check if DCP is enabled (dcp_world_size > 1)."""
+        return self.dcp_world_size > 1

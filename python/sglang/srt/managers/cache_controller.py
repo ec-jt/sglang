@@ -634,12 +634,29 @@ class HiCacheController:
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
+
+        Note: With DCP (Decode Context Parallelism), device_indices are virtual indices
+        that span across all DCP ranks. The translation to physical indices happens
+        in start_writing() when the actual data transfer occurs.
         """
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        # With DCP, we only backup this rank's portion of the KV cache
+        if self.mem_pool_device_allocator.is_dcp_enabled():
+            physical_device_indices = self.mem_pool_device_allocator.translate_virtual_to_physical(
+                device_indices
+            )
+            num_tokens_to_backup = len(physical_device_indices)
+            if num_tokens_to_backup == 0:
+                # This rank has no tokens to backup (all tokens belong to other ranks)
+                return torch.empty((0,), dtype=torch.int64, device="cpu")
+        else:
+            physical_device_indices = device_indices
+            num_tokens_to_backup = len(device_indices)
+
+        host_indices = self.mem_pool_host.alloc(num_tokens_to_backup)
         if host_indices is None:
             return None
         self.write_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(host_indices, physical_device_indices, node_id, priority)
         )
         self.start_writing()
         return host_indices
@@ -680,14 +697,27 @@ class HiCacheController:
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
+
+        Note: With DCP (Decode Context Parallelism), we allocate physical device indices
+        for the actual data transfer, then translate them to virtual indices for storage
+        in the radix tree.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
-        if device_indices is None:
+        if len(host_indices) == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        # Allocate physical device indices
+        physical_device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if physical_device_indices is None:
             return None
         self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(host_indices, physical_device_indices, node_id, priority)
         )
-        return device_indices
+
+        # Translate physical indices to virtual indices for storage in radix tree
+        virtual_device_indices = self.mem_pool_device_allocator.translate_physical_to_virtual(
+            physical_device_indices
+        )
+        return virtual_device_indices
 
     def move_indices(self, op: CacheOperation):
         host_indices, device_indices = op.host_indices, op.device_indices
