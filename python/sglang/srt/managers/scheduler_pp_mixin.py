@@ -101,9 +101,12 @@ class SchedulerPPMixin:
                             f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
                             f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
                         )
-                        # Free KV cache for all requests in the skipped batch to prevent memory leak
+                        # Free KV cache and req_to_token_pool slot for all requests in the skipped batch
                         for req in self.cur_batch.reqs:
                             release_kv_cache(req, self.tree_cache, is_insert=False)
+                            # Also free the req_to_token_pool slot to prevent req_to_token_pool leak
+                            if req.req_pool_idx is not None:
+                                self.req_to_token_pool.free(req)
                         self.cur_batch = None
                         self.mbs[mb_id] = None
                 next_pp_outputs = None
@@ -249,8 +252,15 @@ class SchedulerPPMixin:
                     # skip this batch to avoid KeyError crash in model forward
                     if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
                         logger.warning(
-                            f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected)"
+                            f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
+                            f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
                         )
+                        # Free KV cache and req_to_token_pool slot for all requests in the skipped batch
+                        for req in self.cur_batch.reqs:
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                            # Also free the req_to_token_pool slot to prevent req_to_token_pool leak
+                            if req.req_pool_idx is not None:
+                                self.req_to_token_pool.free(req)
                         self.cur_batch = None
                         self.mbs[mb_id] = None
 
@@ -406,8 +416,15 @@ class SchedulerPPMixin:
                         # skip this batch to avoid KeyError crash in model forward
                         if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
                             logger.warning(
-                                f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected)"
+                                f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
+                                f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
                             )
+                            # Free KV cache and req_to_token_pool slot for all requests in the skipped batch
+                            for req in self.cur_batch.reqs:
+                                release_kv_cache(req, self.tree_cache, is_insert=False)
+                                # Also free the req_to_token_pool slot to prevent req_to_token_pool leak
+                                if req.req_pool_idx is not None:
+                                    self.req_to_token_pool.free(req)
                             self.cur_batch = None
                             self.mbs[mb_id] = None
 
