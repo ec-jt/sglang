@@ -1095,9 +1095,6 @@ class GroupCoordinator:
         
         Returns:
             The received object, or None if timeout occurred.
-        
-        Raises:
-            RuntimeError: If timeout occurs and timeout > 0.
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
         assert (
@@ -1119,10 +1116,11 @@ class GroupCoordinator:
         if timeout_td is not None:
             success = work.wait(timeout=timeout_td)
             if not success:
-                raise RuntimeError(
+                logger.warning(
                     f"PP recv_object timeout after {timeout}s waiting for size from rank {src}. "
-                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    f"This may indicate PP desync. Returning None for graceful recovery."
                 )
+                return None
         else:
             work.wait()
 
@@ -1139,10 +1137,11 @@ class GroupCoordinator:
         if timeout_td is not None:
             success = work.wait(timeout=timeout_td)
             if not success:
-                raise RuntimeError(
+                logger.warning(
                     f"PP recv_object timeout after {timeout}s waiting for data from rank {src}. "
-                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    f"This may indicate PP desync. Returning None for graceful recovery."
                 )
+                return None
         else:
             work.wait()
 
@@ -1301,10 +1300,7 @@ class GroupCoordinator:
                      env var. If that is -1 (default), no timeout is applied.
         
         Returns:
-            The received tensor dictionary, or None if world_size is 1.
-        
-        Raises:
-            RuntimeError: If timeout occurs and timeout > 0.
+            The received tensor dictionary, or None if timeout or world_size is 1.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -1328,6 +1324,13 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src, timeout=timeout)
+        # If recv_object returned None (timeout), propagate gracefully
+        if recv_metadata_list is None:
+            logger.warning(
+                f"PP recv_tensor_dict: recv_object returned None from rank {src}. "
+                f"Returning None for graceful PP desync recovery."
+            )
+            return None
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1355,10 +1358,11 @@ class GroupCoordinator:
                 if timeout_td is not None:
                     success = work.wait(timeout=timeout_td)
                     if not success:
-                        raise RuntimeError(
+                        logger.warning(
                             f"PP recv_tensor_dict timeout after {timeout}s waiting for tensor '{key}' from rank {src}. "
-                            f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                            f"Returning None for graceful PP desync recovery."
                         )
+                        return None
                 else:
                     work.wait()
 

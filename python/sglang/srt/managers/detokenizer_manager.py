@@ -148,7 +148,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                try:
+                    self.send_to_tokenizer.send_pyobj(output, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    # ZMQ send buffer full - use blocking send with timeout to avoid
+                    # indefinite blocking that prevents heartbeat updates.
+                    # This prevents the detokenizer from appearing dead to health checks.
+                    logger.warning(
+                        "Detokenizer send buffer full, retrying with 10s timeout"
+                    )
+                    self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(

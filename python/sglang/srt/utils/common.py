@@ -1285,10 +1285,7 @@ def broadcast_pyobj(
                  env var. If that is -1 (default), no timeout is applied.
     
     Returns:
-        The broadcasted data.
-    
-    Raises:
-        RuntimeError: If timeout occurs and timeout > 0.
+        The broadcasted data, or None if timeout occurred on a non-src rank.
     """
     from datetime import timedelta
     
@@ -1310,10 +1307,11 @@ def broadcast_pyobj(
                 work = dist.broadcast(tensor_size, src=src, group=dist_group, async_op=True)
                 success = work.wait(timeout=timeout_td)
                 if not success:
-                    raise RuntimeError(
+                    logger.warning(
                         f"PP broadcast_pyobj timeout after {timeout}s broadcasting size. "
-                        f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                        f"This may indicate PP desync."
                     )
+                    return data  # src rank always returns its own data
             else:
                 dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
@@ -1329,17 +1327,19 @@ def broadcast_pyobj(
                 work = dist.broadcast(tensor_size, src=src, group=dist_group, async_op=True)
                 success = work.wait(timeout=timeout_td)
                 if not success:
-                    raise RuntimeError(
+                    logger.warning(
                         f"PP broadcast_pyobj timeout after {timeout}s broadcasting size. "
-                        f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                        f"This may indicate PP desync."
                     )
+                    return data
                 work = dist.broadcast(tensor_data, src=src, group=dist_group, async_op=True)
                 success = work.wait(timeout=timeout_td)
                 if not success:
-                    raise RuntimeError(
+                    logger.warning(
                         f"PP broadcast_pyobj timeout after {timeout}s broadcasting data. "
-                        f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                        f"This may indicate PP desync."
                     )
+                    return data
             else:
                 dist.broadcast(tensor_size, src=src, group=dist_group)
                 dist.broadcast(tensor_data, src=src, group=dist_group)
@@ -1350,10 +1350,11 @@ def broadcast_pyobj(
             work = dist.broadcast(tensor_size, src=src, group=dist_group, async_op=True)
             success = work.wait(timeout=timeout_td)
             if not success:
-                raise RuntimeError(
+                logger.warning(
                     f"PP broadcast_pyobj timeout after {timeout}s receiving size from rank {src}. "
-                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    f"Returning None for graceful PP desync recovery."
                 )
+                return None
         else:
             dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
@@ -1366,10 +1367,11 @@ def broadcast_pyobj(
             work = dist.broadcast(tensor_data, src=src, group=dist_group, async_op=True)
             success = work.wait(timeout=timeout_td)
             if not success:
-                raise RuntimeError(
+                logger.warning(
                     f"PP broadcast_pyobj timeout after {timeout}s receiving data from rank {src}. "
-                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    f"Returning None for graceful PP desync recovery."
                 )
+                return None
         else:
             dist.broadcast(tensor_data, src=src, group=dist_group)
 
