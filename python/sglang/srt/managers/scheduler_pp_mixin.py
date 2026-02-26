@@ -70,6 +70,11 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        # Track launched batches separately from self.mbs to prevent the race
+        # where self.mbs[mb_id] is overwritten at get_next_batch_to_run() before
+        # the next_mb_id iteration can process its result. Zero perf overhead:
+        # just Python reference assignments, no data copies or GPU ops.
+        launched_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_loop_size
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -127,6 +132,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                # Save launched batch reference before self.mbs can be overwritten
+                launched_mbs[mb_id] = self.cur_batch
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -134,14 +141,17 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                if self.mbs[next_mb_id] is not None:
+                # Use launched_mbs instead of self.mbs to avoid the race where
+                # self.mbs[next_mb_id] was already overwritten by get_next_batch_to_run
+                if launched_mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            launched_mbs[next_mb_id],
                             next_batch_result,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.last_mbs[next_mb_id] = launched_mbs[next_mb_id]
+                    launched_mbs[next_mb_id] = None
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
