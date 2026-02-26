@@ -489,6 +489,11 @@ class Envs:
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
 
+    # PP (Pipeline Parallelism) communication timeouts
+    # Timeout for PP recv operations (recv_object, recv_tensor_dict, broadcast_pyobj)
+    # Set to -1 to disable timeout (default). Recommended: 300-600 for PP deployments.
+    SGLANG_PP_RECV_TIMEOUT = EnvFloat(-1)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

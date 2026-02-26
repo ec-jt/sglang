@@ -1271,11 +1271,32 @@ def broadcast_pyobj(
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     force_cpu_device: bool = True,
+    timeout: Optional[float] = None,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
-    The `rank` here refer to the source rank on global process group (regardless
-    of dist_group argument).
+    
+    Args:
+        data: The data to broadcast (only used by src rank).
+        rank: The current rank in the global process group.
+        dist_group: Optional process group for the broadcast.
+        src: The source rank that sends the data.
+        force_cpu_device: Whether to force CPU device for tensors.
+        timeout: Optional timeout in seconds. If None, uses SGLANG_PP_RECV_TIMEOUT
+                 env var. If that is -1 (default), no timeout is applied.
+    
+    Returns:
+        The broadcasted data.
+    
+    Raises:
+        RuntimeError: If timeout occurs and timeout > 0.
     """
+    from datetime import timedelta
+    
+    # Determine timeout
+    if timeout is None:
+        timeout = envs.SGLANG_PP_RECV_TIMEOUT.get()
+    timeout_td = timedelta(seconds=timeout) if timeout > 0 else None
+    
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not force_cpu_device
@@ -1285,7 +1306,16 @@ def broadcast_pyobj(
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
+            if timeout_td is not None:
+                work = dist.broadcast(tensor_size, src=src, group=dist_group, async_op=True)
+                success = work.wait(timeout=timeout_td)
+                if not success:
+                    raise RuntimeError(
+                        f"PP broadcast_pyobj timeout after {timeout}s broadcasting size. "
+                        f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    )
+            else:
+                dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -1295,19 +1325,53 @@ def broadcast_pyobj(
             ).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
+            if timeout_td is not None:
+                work = dist.broadcast(tensor_size, src=src, group=dist_group, async_op=True)
+                success = work.wait(timeout=timeout_td)
+                if not success:
+                    raise RuntimeError(
+                        f"PP broadcast_pyobj timeout after {timeout}s broadcasting size. "
+                        f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    )
+                work = dist.broadcast(tensor_data, src=src, group=dist_group, async_op=True)
+                success = work.wait(timeout=timeout_td)
+                if not success:
+                    raise RuntimeError(
+                        f"PP broadcast_pyobj timeout after {timeout}s broadcasting data. "
+                        f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                    )
+            else:
+                dist.broadcast(tensor_size, src=src, group=dist_group)
+                dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
+        if timeout_td is not None:
+            work = dist.broadcast(tensor_size, src=src, group=dist_group, async_op=True)
+            success = work.wait(timeout=timeout_td)
+            if not success:
+                raise RuntimeError(
+                    f"PP broadcast_pyobj timeout after {timeout}s receiving size from rank {src}. "
+                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                )
+        else:
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
+        if timeout_td is not None:
+            work = dist.broadcast(tensor_data, src=src, group=dist_group, async_op=True)
+            success = work.wait(timeout=timeout_td)
+            if not success:
+                raise RuntimeError(
+                    f"PP broadcast_pyobj timeout after {timeout}s receiving data from rank {src}. "
+                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                )
+        else:
+            dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)

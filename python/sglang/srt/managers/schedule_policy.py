@@ -549,6 +549,9 @@ class PrefillAdder:
         req.extend_input_len = trunc_len
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
+        # Increment lock reference on the tree node to protect the cached prefix.
+        self._req_inc_lock_ref(req)
+
         self.can_run_list.append(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
@@ -571,6 +574,10 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+
+        # Increment lock reference on the tree node to protect the cached prefix.
+        self._req_inc_lock_ref(req)
+
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -605,6 +612,13 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+
+        # Increment lock reference on the tree node to protect the cached prefix.
+        # This is critical for memory accounting - without this, the tree cache's
+        # protected_size won't include this request's cached tokens, causing
+        # memory leak detection to fail (available + evictable + protected != total).
+        self._req_inc_lock_ref(req)
+
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -699,6 +713,8 @@ class PrefillAdder:
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill
+            # Increment lock reference on the tree node to protect the cached prefix.
+            self._req_inc_lock_ref(req)
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -714,6 +730,8 @@ class PrefillAdder:
 
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
+            # Increment lock reference on the tree node to protect the cached prefix.
+            self._req_inc_lock_ref(req)
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)

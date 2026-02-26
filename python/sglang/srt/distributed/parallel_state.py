@@ -1084,14 +1084,30 @@ class GroupCoordinator:
     def recv_object(
         self,
         src: int,
+        timeout: Optional[float] = None,
     ) -> Any:
-        """Receive the input object list from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
-
+        """Receive the input object list from the source rank.
+        
+        Args:
+            src: The local rank of the source rank.
+            timeout: Optional timeout in seconds. If None, uses SGLANG_PP_RECV_TIMEOUT
+                     env var. If that is -1 (default), no timeout is applied.
+        
+        Returns:
+            The received object, or None if timeout occurred.
+        
+        Raises:
+            RuntimeError: If timeout occurs and timeout > 0.
+        """
         assert src < self.world_size, f"Invalid src rank ({src})"
         assert (
             src != self.rank_in_group
         ), "Invalid source rank. Source rank is the same as the current rank."
+
+        # Determine timeout
+        if timeout is None:
+            timeout = envs.SGLANG_PP_RECV_TIMEOUT.get()
+        timeout_td = timedelta(seconds=timeout) if timeout > 0 else None
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -1100,7 +1116,15 @@ class GroupCoordinator:
         work = torch.distributed.irecv(
             size_tensor, src=self.ranks[src], group=self.cpu_group
         )
-        work.wait()
+        if timeout_td is not None:
+            success = work.wait(timeout=timeout_td)
+            if not success:
+                raise RuntimeError(
+                    f"PP recv_object timeout after {timeout}s waiting for size from rank {src}. "
+                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                )
+        else:
+            work.wait()
 
         # Tensor to receive serialized objects into.
         object_tensor: Any = torch.empty(  # type: ignore[call-overload]
@@ -1112,7 +1136,15 @@ class GroupCoordinator:
         work = torch.distributed.irecv(
             object_tensor, src=self.ranks[src], group=self.cpu_group
         )
-        work.wait()
+        if timeout_td is not None:
+            success = work.wait(timeout=timeout_td)
+            if not success:
+                raise RuntimeError(
+                    f"PP recv_object timeout after {timeout}s waiting for data from rank {src}. "
+                    f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                )
+        else:
+            work.wait()
 
         obj = pickle.loads(object_tensor.numpy())
         return obj
@@ -1258,13 +1290,30 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        timeout: Optional[float] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
-        NOTE: `src` is the local rank of the source rank.
+        
+        Args:
+            src: The local rank of the source rank. If None, defaults to previous rank.
+            all_gather_group: Optional group for all-gather operation.
+            timeout: Optional timeout in seconds. If None, uses SGLANG_PP_RECV_TIMEOUT
+                     env var. If that is -1 (default), no timeout is applied.
+        
+        Returns:
+            The received tensor dictionary, or None if world_size is 1.
+        
+        Raises:
+            RuntimeError: If timeout occurs and timeout > 0.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
+
+        # Determine timeout
+        if timeout is None:
+            timeout = envs.SGLANG_PP_RECV_TIMEOUT.get()
+        timeout_td = timedelta(seconds=timeout) if timeout > 0 else None
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
         all_gather_rank = (
@@ -1278,7 +1327,7 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self.recv_object(src=src, timeout=timeout)
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1303,7 +1352,15 @@ class GroupCoordinator:
                 work = torch.distributed.irecv(
                     tensor, src=self.ranks[src], group=comm_group
                 )
-                work.wait()
+                if timeout_td is not None:
+                    success = work.wait(timeout=timeout_td)
+                    if not success:
+                        raise RuntimeError(
+                            f"PP recv_tensor_dict timeout after {timeout}s waiting for tensor '{key}' from rank {src}. "
+                            f"This may indicate PP desync. Consider increasing SGLANG_PP_RECV_TIMEOUT."
+                        )
+                else:
+                    work.wait()
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
