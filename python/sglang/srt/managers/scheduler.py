@@ -2685,12 +2685,24 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def _is_no_request(self):
+        pp_mbs = getattr(self, "mbs", None)
+        pp_last_mbs = getattr(self, "last_mbs", None)
         no_request = (
             self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            and (
+                self.pp_size == 1
+                or pp_mbs is None
+                or all(x is None or x.is_empty() for x in pp_mbs)
+            )
+            and (
+                self.pp_size == 1
+                or pp_last_mbs is None
+                or all(x is None or x.is_empty() for x in pp_last_mbs)
+            )
             and self.chunked_req is None
             and len(self.offload_tags) == 0
             and not self.dllm_manager.any_staging_reqs()
