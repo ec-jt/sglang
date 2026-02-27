@@ -5,7 +5,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -43,6 +43,18 @@ class PPBatchMetadata:
     can_run_cuda_graph: bool
 
 
+@dataclass
+class PPInFlightCompletionEntry:
+    mb_id: int
+    batch_ref: ScheduleBatch
+    launch_seq: int
+    status: Literal["LAUNCHED", "DESYNC_DROPPED", "FINALIZED"]
+    reason: str
+    result_ref: Optional[GenerationBatchResult] = None
+    d2h_event: Optional[torch.cuda.Event] = None
+    ready_to_finalize: bool = False
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -70,10 +82,9 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
-        # Track launched batches separately from self.mbs to prevent the race
-        # where self.mbs[mb_id] is overwritten at get_next_batch_to_run() before
-        # the next_mb_id iteration can process its result. Zero perf overhead:
-        # just Python reference assignments, no data copies or GPU ops.
+        self._pp_init_finalize_state()
+        # Track launched batches separately from self.mbs to prevent overwrite races
+        # in completion/finalization bookkeeping.
         launched_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_loop_size
         while True:
             server_is_idle = True
@@ -104,14 +115,13 @@ class SchedulerPPMixin:
                     if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
                         logger.warning(
                             f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
-                            f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
+                            f"Queueing dropped batch finalization for {len(self.cur_batch.reqs)} requests."
                         )
-                        # Free KV cache and req_to_token_pool slot for all requests in the skipped batch
-                        for req in self.cur_batch.reqs:
-                            release_kv_cache(req, self.tree_cache, is_insert=False)
-                            # Also free the req_to_token_pool slot to prevent req_to_token_pool leak
-                            if req.req_pool_idx is not None:
-                                self.req_to_token_pool.free(req)
+                        self._pp_enqueue_dropped_entry(
+                            mb_id,
+                            self.cur_batch,
+                            reason="missing_proxy_tensors",
+                        )
                         self.cur_batch = None
                         self.mbs[mb_id] = None
                 next_pp_outputs = None
@@ -132,8 +142,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                # Save launched batch reference before self.mbs can be overwritten
-                launched_mbs[mb_id] = self.cur_batch
+                    launched_mbs[mb_id] = self.cur_batch
+                    self._pp_enqueue_launched_entry(mb_id, self.cur_batch)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -141,17 +151,13 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                # Use launched_mbs instead of self.mbs to avoid the race where
-                # self.mbs[next_mb_id] was already overwritten by get_next_batch_to_run
                 if launched_mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            launched_mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    self.last_mbs[next_mb_id] = launched_mbs[next_mb_id]
-                    launched_mbs[next_mb_id] = None
+                    self._pp_mark_entry_ready(
+                        mb_id=next_mb_id,
+                        output_result=next_batch_result,
+                        d2h_event=d2h_event,
+                    )
+                self._pp_drain_completed_entries(launched_mbs)
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
@@ -164,8 +170,10 @@ class SchedulerPPMixin:
                             )
 
                 self.pp_outputs = next_pp_outputs
+                self._pp_maybe_log_finalize_counters()
 
             # When the server is idle, self-check and re-init some states
+            self._pp_drain_completed_entries(launched_mbs)
             if server_is_idle:
                 self.self_check_during_idle()
 
@@ -208,10 +216,12 @@ class SchedulerPPMixin:
 
         """
         self.init_pp_loop_state()
+        self._pp_init_finalize_state()
 
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
+        launched_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
@@ -263,14 +273,13 @@ class SchedulerPPMixin:
                     if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
                         logger.warning(
                             f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
-                            f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
+                            f"Queueing dropped batch finalization for {len(self.cur_batch.reqs)} requests."
                         )
-                        # Free KV cache and req_to_token_pool slot for all requests in the skipped batch
-                        for req in self.cur_batch.reqs:
-                            release_kv_cache(req, self.tree_cache, is_insert=False)
-                            # Also free the req_to_token_pool slot to prevent req_to_token_pool leak
-                            if req.req_pool_idx is not None:
-                                self.req_to_token_pool.free(req)
+                        self._pp_enqueue_dropped_entry(
+                            mb_id,
+                            self.cur_batch,
+                            reason="missing_proxy_tensors",
+                        )
                         self.cur_batch = None
                         self.mbs[mb_id] = None
 
@@ -289,6 +298,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    launched_mbs[mb_id] = self.cur_batch
+                    self._pp_enqueue_launched_entry(mb_id, self.cur_batch)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -322,13 +333,13 @@ class SchedulerPPMixin:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
-                        next_batch_result,
+                if launched_mbs[next_mb_id] is not None:
+                    self._pp_mark_entry_ready(
+                        mb_id=next_mb_id,
+                        output_result=next_batch_result,
+                        d2h_event=d2h_event,
                     )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                self._pp_drain_completed_entries(launched_mbs)
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -352,21 +363,25 @@ class SchedulerPPMixin:
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
+                self._pp_maybe_log_finalize_counters()
 
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
+            self._pp_drain_completed_entries(launched_mbs)
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.init_pp_loop_state()
+        self._pp_init_finalize_state()
 
         # PD additional state initialization
         rmbs = [None] * self.pp_loop_size
         pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
+        launched_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_loop_size
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
         release_rids: Optional[List[str]] = None  # consensus transferred rids
@@ -427,14 +442,13 @@ class SchedulerPPMixin:
                         if not self.pp_group.is_first_rank and pp_proxy_tensors is None:
                             logger.warning(
                                 f"[PP{self.pp_rank}] Skipping batch due to missing proxy tensors (PP desync detected). "
-                                f"Releasing KV cache for {len(self.cur_batch.reqs)} requests to prevent memory leak."
+                                f"Queueing dropped batch finalization for {len(self.cur_batch.reqs)} requests."
                             )
-                            # Free KV cache and req_to_token_pool slot for all requests in the skipped batch
-                            for req in self.cur_batch.reqs:
-                                release_kv_cache(req, self.tree_cache, is_insert=False)
-                                # Also free the req_to_token_pool slot to prevent req_to_token_pool leak
-                                if req.req_pool_idx is not None:
-                                    self.req_to_token_pool.free(req)
+                            self._pp_enqueue_dropped_entry(
+                                mb_id,
+                                self.cur_batch,
+                                reason="missing_proxy_tensors",
+                            )
                             self.cur_batch = None
                             self.mbs[mb_id] = None
 
@@ -455,6 +469,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    launched_mbs[mb_id] = self.cur_batch
+                    self._pp_enqueue_launched_entry(mb_id, self.cur_batch)
 
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -515,14 +531,20 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
 
                 # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
+                if launched_mbs[next_mb_id] is not None:
+                    if launched_mbs[next_mb_id].forward_mode.is_prebuilt():
+                        self._pp_mark_entry_ready(
+                            mb_id=next_mb_id,
+                            output_result=None,
+                            d2h_event=None,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    else:
+                        self._pp_mark_entry_ready(
+                            mb_id=next_mb_id,
+                            output_result=next_batch_result,
+                            d2h_event=d2h_event,
+                        )
+                self._pp_drain_completed_entries(launched_mbs)
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -548,6 +570,7 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
+                self._pp_maybe_log_finalize_counters()
 
                 self.running_batch.batch_is_full = False
 
@@ -560,8 +583,129 @@ class SchedulerPPMixin:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
+            self._pp_drain_completed_entries(launched_mbs)
             if server_is_idle and queue_size == 0:
                 self.self_check_during_idle()
+
+    def _pp_init_finalize_state(self: Scheduler):
+        self.pp_inflight_entries: deque[PPInFlightCompletionEntry] = deque()
+        self.pp_inflight_entries_by_mb: Dict[int, PPInFlightCompletionEntry] = {}
+        self.pp_launch_seq = 0
+        self.pp_finalize_log_interval = 30.0
+        self.pp_last_finalize_log_time = time.perf_counter()
+
+        self.pp_launched_batches = 0
+        self.pp_finalized_batches = 0
+        self.pp_launched_reqs = 0
+        self.pp_finalized_reqs = 0
+        self.pp_dropped_batches = 0
+
+    def _pp_enqueue_launched_entry(
+        self: Scheduler,
+        mb_id: int,
+        batch: ScheduleBatch,
+    ):
+        entry = PPInFlightCompletionEntry(
+            mb_id=mb_id,
+            batch_ref=batch,
+            launch_seq=self.pp_launch_seq,
+            status="LAUNCHED",
+            reason="normal",
+        )
+        self.pp_launch_seq += 1
+        self.pp_inflight_entries.append(entry)
+        self.pp_inflight_entries_by_mb[mb_id] = entry
+        self.pp_launched_batches += 1
+        self.pp_launched_reqs += len(batch.reqs)
+
+    def _pp_enqueue_dropped_entry(
+        self: Scheduler,
+        mb_id: int,
+        batch: ScheduleBatch,
+        reason: str,
+    ):
+        entry = PPInFlightCompletionEntry(
+            mb_id=mb_id,
+            batch_ref=batch,
+            launch_seq=self.pp_launch_seq,
+            status="DESYNC_DROPPED",
+            reason=reason,
+            ready_to_finalize=True,
+        )
+        self.pp_launch_seq += 1
+        self.pp_inflight_entries.append(entry)
+        self.pp_dropped_batches += 1
+
+    def _pp_mark_entry_ready(
+        self: Scheduler,
+        mb_id: int,
+        output_result: Optional[GenerationBatchResult],
+        d2h_event: Optional[torch.cuda.Event],
+    ):
+        entry = self.pp_inflight_entries_by_mb.pop(mb_id, None)
+        if entry is None:
+            return
+        if entry.status != "LAUNCHED":
+            return
+        entry.result_ref = output_result
+        entry.d2h_event = d2h_event
+        entry.ready_to_finalize = True
+
+    def _finalize_request_resources(
+        self: Scheduler, req: Req, reason: str, is_insert: bool = False
+    ) -> bool:
+        if req.req_pool_idx is None:
+            return False
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        logger.debug(
+            f"[PP{self.pp_rank}] Finalized request resources for rid={req.rid}, reason={reason}"
+        )
+        return True
+
+    def _pp_drain_completed_entries(self: Scheduler, launched_mbs: List[Optional[ScheduleBatch]]):
+        while self.pp_inflight_entries and self.pp_inflight_entries[0].ready_to_finalize:
+            entry = self.pp_inflight_entries.popleft()
+            if entry.status == "LAUNCHED":
+                if not entry.batch_ref.forward_mode.is_prebuilt():
+                    if entry.d2h_event is None or entry.result_ref is None:
+                        logger.warning(
+                            f"[PP{self.pp_rank}] Missing result or event for launch_seq={entry.launch_seq}, mb_id={entry.mb_id}; skipping finalize iteration"
+                        )
+                        # Put it back to avoid dropping ownership.
+                        self.pp_inflight_entries.appendleft(entry)
+                        break
+                    entry.d2h_event.synchronize()
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(entry.batch_ref, entry.result_ref)
+                self.last_mbs[entry.mb_id] = entry.batch_ref
+                launched_mbs[entry.mb_id] = None
+                self.pp_finalized_batches += 1
+                self.pp_finalized_reqs += len(entry.batch_ref.reqs)
+                entry.status = "FINALIZED"
+            elif entry.status == "DESYNC_DROPPED":
+                for req in entry.batch_ref.reqs:
+                    self._finalize_request_resources(
+                        req,
+                        reason=f"pp_drop:{entry.reason}",
+                        is_insert=False,
+                    )
+                entry.status = "FINALIZED"
+
+            logger.debug(
+                f"[PP{self.pp_rank}] Finalized inflight entry launch_seq={entry.launch_seq}, mb_id={entry.mb_id}, status={entry.status}, reason={entry.reason}"
+            )
+
+    def _pp_maybe_log_finalize_counters(self: Scheduler):
+        now = time.perf_counter()
+        if now - self.pp_last_finalize_log_time < self.pp_finalize_log_interval:
+            return
+        self.pp_last_finalize_log_time = now
+        logger.info(
+            f"[PP{self.pp_rank}] queue_finalize_stats "
+            f"launched_batches={self.pp_launched_batches} finalized_batches={self.pp_finalized_batches} "
+            f"launched_reqs={self.pp_launched_reqs} finalized_reqs={self.pp_finalized_reqs} "
+            f"dropped_batches={self.pp_dropped_batches} inflight_entries={len(self.pp_inflight_entries)}"
+        )
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
