@@ -176,7 +176,11 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             self._pp_drain_completed_entries(launched_mbs)
-            if server_is_idle and self._pp_is_finalize_quiesced(launched_mbs):
+            if (
+                server_is_idle
+                and self._pp_is_finalize_quiesced(launched_mbs)
+                and self._is_no_request()
+            ):
                 self.self_check_during_idle()
 
     @DynamicGradMode()
@@ -377,6 +381,7 @@ class SchedulerPPMixin:
                 server_is_idle
                 and len(self.disagg_prefill_inflight_queue) == 0
                 and self._pp_is_finalize_quiesced(launched_mbs)
+                and self._is_no_request()
             ):
                 self.self_check_during_idle()
 
@@ -598,6 +603,7 @@ class SchedulerPPMixin:
                 server_is_idle
                 and queue_size == 0
                 and self._pp_is_finalize_quiesced(launched_mbs)
+                and self._is_no_request()
             ):
                 self.self_check_during_idle()
 

@@ -315,6 +315,18 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # Requests in queue may legally hold req_pool / KV ownership before they are
+        # scheduled into a runnable batch. Treat this as non-idle for memory checks.
+        if len(self.waiting_queue) > 0 or len(self.grammar_manager) > 0:
+            return
+
+        # In PP mode, completion ownership may still be tracked in explicit in-flight
+        # finalize queue. Do not run idle leak checks until that queue is drained.
+        if getattr(self, "pp_size", 1) > 1 and len(
+            getattr(self, "pp_inflight_entries", [])
+        ) > 0:
+            return
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
