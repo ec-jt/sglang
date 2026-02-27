@@ -628,8 +628,14 @@ class SchedulerPPMixin:
     def _pp_is_finalize_quiesced(
         self: Scheduler, launched_mbs: List[Optional[ScheduleBatch]]
     ) -> bool:
-        return len(self.pp_inflight_entries) == 0 and all(
-            batch is None for batch in launched_mbs
+        return (
+            len(self.pp_inflight_entries) == 0
+            and len(self.pp_inflight_entries_by_mb) == 0
+            and all(batch is None for batch in launched_mbs)
+            and len(self.send_req_work) == 0
+            and len(self.send_proxy_work) == 0
+            and len(self.send_output_work) == 0
+            and len(self.last_rank_comm_queue) == 0
         )
 
     def _pp_init_finalize_state(self: Scheduler):
@@ -639,7 +645,11 @@ class SchedulerPPMixin:
         self.pp_finalize_log_interval = 30.0
         self.pp_last_finalize_log_time = time.perf_counter()
         self.pp_idle_quiescent_rounds = 0
-        self.pp_idle_check_quiescent_rounds = max(2, self.pp_size)
+        self.pp_idle_check_quiescent_rounds = (
+            max(4, self.pp_size * 2)
+            if self.server_args.pp_async_batch_depth == 0
+            else max(2, self.pp_size)
+        )
 
         self.pp_launched_batches = 0
         self.pp_finalized_batches = 0
