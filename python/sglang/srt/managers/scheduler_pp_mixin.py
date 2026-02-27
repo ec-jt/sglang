@@ -176,7 +176,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             self._pp_drain_completed_entries(launched_mbs)
-            if server_is_idle:
+            if server_is_idle and self._pp_is_finalize_quiesced(launched_mbs):
                 self.self_check_during_idle()
 
     @DynamicGradMode()
@@ -373,7 +373,11 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             self._pp_drain_completed_entries(launched_mbs)
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
+            if (
+                server_is_idle
+                and len(self.disagg_prefill_inflight_queue) == 0
+                and self._pp_is_finalize_quiesced(launched_mbs)
+            ):
                 self.self_check_during_idle()
 
     @DynamicGradMode()
@@ -590,8 +594,19 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             self._pp_drain_completed_entries(launched_mbs)
-            if server_is_idle and queue_size == 0:
+            if (
+                server_is_idle
+                and queue_size == 0
+                and self._pp_is_finalize_quiesced(launched_mbs)
+            ):
                 self.self_check_during_idle()
+
+    def _pp_is_finalize_quiesced(
+        self: Scheduler, launched_mbs: List[Optional[ScheduleBatch]]
+    ) -> bool:
+        return len(self.pp_inflight_entries) == 0 and all(
+            batch is None for batch in launched_mbs
+        )
 
     def _pp_init_finalize_state(self: Scheduler):
         self.pp_inflight_entries: deque[PPInFlightCompletionEntry] = deque()
