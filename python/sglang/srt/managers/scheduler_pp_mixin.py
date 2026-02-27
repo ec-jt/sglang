@@ -176,11 +176,17 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             self._pp_drain_completed_entries(launched_mbs)
-            if (
+            should_check_idle = (
                 server_is_idle
                 and self._pp_is_finalize_quiesced(launched_mbs)
                 and self._is_no_request()
-            ):
+            )
+            if should_check_idle:
+                self.pp_idle_quiescent_rounds += 1
+            else:
+                self.pp_idle_quiescent_rounds = 0
+
+            if self.pp_idle_quiescent_rounds >= self.pp_idle_check_quiescent_rounds:
                 self.self_check_during_idle()
 
     @DynamicGradMode()
@@ -377,12 +383,18 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             self._pp_drain_completed_entries(launched_mbs)
-            if (
+            should_check_idle = (
                 server_is_idle
                 and len(self.disagg_prefill_inflight_queue) == 0
                 and self._pp_is_finalize_quiesced(launched_mbs)
                 and self._is_no_request()
-            ):
+            )
+            if should_check_idle:
+                self.pp_idle_quiescent_rounds += 1
+            else:
+                self.pp_idle_quiescent_rounds = 0
+
+            if self.pp_idle_quiescent_rounds >= self.pp_idle_check_quiescent_rounds:
                 self.self_check_during_idle()
 
     @DynamicGradMode()
@@ -599,12 +611,18 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             self._pp_drain_completed_entries(launched_mbs)
-            if (
+            should_check_idle = (
                 server_is_idle
                 and queue_size == 0
                 and self._pp_is_finalize_quiesced(launched_mbs)
                 and self._is_no_request()
-            ):
+            )
+            if should_check_idle:
+                self.pp_idle_quiescent_rounds += 1
+            else:
+                self.pp_idle_quiescent_rounds = 0
+
+            if self.pp_idle_quiescent_rounds >= self.pp_idle_check_quiescent_rounds:
                 self.self_check_during_idle()
 
     def _pp_is_finalize_quiesced(
@@ -620,6 +638,8 @@ class SchedulerPPMixin:
         self.pp_launch_seq = 0
         self.pp_finalize_log_interval = 30.0
         self.pp_last_finalize_log_time = time.perf_counter()
+        self.pp_idle_quiescent_rounds = 0
+        self.pp_idle_check_quiescent_rounds = max(2, self.pp_size)
 
         self.pp_launched_batches = 0
         self.pp_finalized_batches = 0
